@@ -1,0 +1,153 @@
+*lvim-fuzzy.txt*        The shared native fuzzy-matching engine for lvim-tech
+
+==============================================================================
+CONTENTS                                                        *lvim-fuzzy*
+
+  1. Introduction ........................... |lvim-fuzzy-intro|
+  2. Setup .................................. |lvim-fuzzy-setup|
+  3. API .................................... |lvim-fuzzy-api|
+  4. Backends & correctness ................. |lvim-fuzzy-backends|
+  5. Building the native library ............ |lvim-fuzzy-build|
+  6. Distribution ........................... |lvim-fuzzy-dist|
+  7. Health ................................. |lvim-fuzzy-health|
+
+==============================================================================
+1. INTRODUCTION                                           *lvim-fuzzy-intro*
+
+lvim-fuzzy is the shared fuzzy-matching ENGINE for the lvim-tech set. lvim-cmp
+and lvim-picker both rank through it, so they order results one identical way.
+
+The hot path is a small Rust shared library (in `native/`) loaded IN-PROCESS via
+LuaJIT FFI: an affine-gap local-alignment scorer with first-char / word-boundary
+/ camelCase / consecutive-run bonuses folded into the score, an inter-candidate
+AVX2 SIMD tile that ranks 16 candidates per instruction, an O(1) byte-signature
+prefilter, and a stable O(n) radix sort. On our benchmark it is faster than a
+leading Rust SIMD fuzzy matcher on every tested query, at both 5k and 20k
+candidates.
+
+The Lua<->native boundary is COARSE: the candidate set is uploaded ONCE per
+completion / pick (|lvim-fuzzy.prepare|), then every keystroke is a SINGLE FFI
+call carrying only the query and returning sorted indices + scores — never a
+call per candidate.
+
+When the library is not present (no Rust toolchain, or a platform without a
+prebuilt binary) lvim-fuzzy transparently uses a BYTE-IDENTICAL pure-Lua matcher
+(|lvim-fuzzy-backends|), so results never change depending on the backend.
+
+The ranking model is fixed on purpose: lvim-fuzzy is an engine, not a UI, and
+its determinism is a guarantee its consumers rely on. The result order is a
+TOTAL, deterministic order: score descending, then shorter candidate, then
+source index ascending — no arbitrary equal-score reshuffling.
+
+==============================================================================
+2. SETUP                                                  *lvim-fuzzy-setup*
+
+Calling setup() is optional; the defaults work. setup() merges your overrides
+into the live config in place.
+>lua
+  require("lvim-fuzzy").setup({
+      backend = "auto",         -- "auto" | "native" | "lua"
+      library_path = nil,       -- explicit .so path; nil = auto-probe
+      max_results = 1000,       -- cap on ranked results per query (0 = no cap)
+      warn_on_fallback = true,  -- notify once when the Lua fallback is used
+  })
+<
+                                                         *lvim-fuzzy-config*
+backend        "auto" loads the native library when present and ABI-compatible
+               and uses the Lua fallback otherwise; "native" requires the .so
+               (reported as an error in |:checkhealth|); "lua" forces the
+               fallback.
+library_path   Absolute path to liblvimfuzzy.{so,dylib,dll}. nil probes, in
+               order: `$LVIM_FUZZY_LIB`, `native/build/`, `native/target/release/`.
+max_results    Hard cap on the materialised result list per query, so a broad
+               query over a huge set never builds hundreds of thousands of rows
+               on a keystroke. 0 disables the cap.
+warn_on_fallback  Emit one INFO notification the first time a match runs on the
+               pure-Lua fallback.
+
+==============================================================================
+3. API                                                      *lvim-fuzzy-api*
+
+                                                        *lvim-fuzzy.prepare()*
+require("lvim-fuzzy").prepare({candidates})            → ctx
+    Build a matching context for a fixed candidate set (a list of strings,
+    searched by their bytes). Do this ONCE per completion / pick. Returns an
+    opaque `ctx` to pass to |lvim-fuzzy.match|.
+
+                                                          *lvim-fuzzy.match()*
+require("lvim-fuzzy").match({query}, {ctx})            → results, count
+    Rank `ctx`'s candidates against `query`. Returns a list of
+    `{ index = <1-based index into candidates>, score = <integer> }` in ranked
+    order, and the count. Call it on every keystroke — it is one FFI call.
+
+                                                         *lvim-fuzzy.filter()*
+require("lvim-fuzzy").filter({candidates}, {query})    → results, count
+    One-off stateless rank (prepare + match in a single call) for callers that
+    do not keep a context. Does not disturb an active prepared context.
+
+                                                        *lvim-fuzzy.backend()*
+require("lvim-fuzzy").backend()  → "native-avx2" | "native-scalar" | "lua"
+
+Other introspection: `native_loaded()`, `library_path()`, `abi()`,
+`native_abi()` — used by |lvim-fuzzy-health|.
+
+Example: >lua
+    local fuzzy = require("lvim-fuzzy")
+    local ctx = fuzzy.prepare({ "getClient", "config_set", "buffer.line" })
+    local results = fuzzy.match("gc", ctx)
+    for _, r in ipairs(results) do
+        print(r.index, r.score)
+    end
+<
+==============================================================================
+4. BACKENDS & CORRECTNESS                                *lvim-fuzzy-backends*
+
+Two backends, one ranking:
+
+  native   the Rust cdylib. On an AVX2 x86_64 CPU the inter-candidate SIMD tile
+           is active ("native-avx2"); otherwise a scalar path ("native-scalar").
+           The SIMD and scalar paths are proven byte-identical by an in-crate
+           test (`simd_matches_scalar`).
+  lua      the pure-Lua matcher in `lua/lvim-fuzzy/fallback.lua`, a byte-exact
+           mirror of the native scorer — same bonus constants, same affine-gap
+           recurrence, same deterministic total order.
+
+Because every path implements the identical model, a consumer sees the SAME
+ranking regardless of which backend runs. |:checkhealth| runs a live parity
+diff of the two backends whenever both are available.
+
+==============================================================================
+5. BUILDING THE NATIVE LIBRARY                             *lvim-fuzzy-build*
+
+The native library is optional — without it the pure-Lua fallback runs. To
+build it (requires a Rust toolchain, `cargo`): >
+    sh native/build.sh
+<
+This produces `native/build/liblvimfuzzy.{so,dylib,dll}`, the first path the
+Lua loader probes. Set `$LVIM_FUZZY_LIB` or `config.library_path` to load a
+library from elsewhere (e.g. a prebuilt release binary).
+
+==============================================================================
+6. DISTRIBUTION                                             *lvim-fuzzy-dist*
+
+Install with the lvim-tech installer (lvim-installer) or Neovim's native
+|vim.pack|. The native library reaches users by, in order of preference:
+
+  1. build-on-install — the lvim-installer post-install step runs
+     `sh native/build.sh` when a Rust toolchain is present;
+  2. a prebuilt, sha256-verified per-platform binary attached to the GitHub
+     release (loaded when no toolchain is available);
+  3. the pure-Lua fallback — always works, no toolchain, no network.
+
+The ABI version is gated by `lvimfuzzy_abi()`: the loader refuses a library
+whose ABI differs from the one this Lua expects and uses the fallback instead.
+
+==============================================================================
+7. HEALTH                                                 *lvim-fuzzy-health*
+
+`:checkhealth lvim-fuzzy` reports: the active backend and the library path,
+whether the .so's ABI matches, whether AVX2 is available, config validity, and
+— when both backends are loadable — a live byte-for-byte parity diff of the
+native and Lua matchers over a sample set.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

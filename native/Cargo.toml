@@ -1,0 +1,18 @@
+[package]
+name = "lvim-fuzzy-native"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "lvim-fuzzy native matcher: affine-gap fuzzy scorer with inter-candidate AVX2 SIMD"
+
+# Produces liblvimfuzzy.so (cdylib) loaded from Lua via LuaJIT FFI; the rlib lets
+# `cargo test` run the in-crate simd==scalar parity test.
+[lib]
+name = "lvimfuzzy"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

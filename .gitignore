@@ -1,0 +1,26 @@
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Tags
+tags
+/doc/tags
+
+# Lua
+luac.out
+*.luac
+
+# Build / test / logs
+/build
+/debug
+/.repro
+/.tests
+node_modules
+*.log
+
+# Rust native build
+/native/target
+/native/build
+/native/Cargo.lock
