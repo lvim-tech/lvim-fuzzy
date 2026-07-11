@@ -141,13 +141,18 @@ function M.check()
         end
     end
 
-    -- ABI report
+    -- ABI report — the loader accepts any library reporting ABI ≥ abi_min()
     if fuzzy.native_loaded() then
         local nabi = fuzzy.native_abi()
-        if nabi == fuzzy.abi() then
-            h.ok(("ABI %d matches"):format(nabi))
+        if nabi and nabi >= fuzzy.abi_min() then
+            h.ok(("ABI %d (accepted; this Lua understands up to %d)"):format(nabi, fuzzy.abi()))
+            if fuzzy.has_append() then
+                h.ok("incremental append supported (ABI ≥ 2)")
+            else
+                h.info("library predates incremental append (ABI < 2) — append falls back to a full re-prepare")
+            end
         else
-            h.error(("ABI mismatch: library reports %s, Lua expects %d"):format(tostring(nabi), fuzzy.abi()))
+            h.error(("ABI too old: library reports %s, need ≥ %d"):format(tostring(nabi), fuzzy.abi_min()))
         end
     end
 

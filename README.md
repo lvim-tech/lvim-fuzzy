@@ -79,15 +79,49 @@ local ctx = fuzzy.prepare({ "getClient", "config_set", "buffer.line" })
 -- results[k] = { index = <1-based index into candidates>, score = <integer> }
 local results, count = fuzzy.match("gc", ctx)
 
+-- Grow the pool WITHOUT rebuilding it: only the new candidates are scanned.
+-- match() then ranks the whole grown set; result is identical to prepare(old ++ new).
+fuzzy.append(ctx, { "getConfig", "get_client" })
+
+-- Optionally release a large context's native memory when done (harmless to skip):
+fuzzy.free(ctx)
+
 -- One-off stateless rank (prepare + match), for callers that keep no context:
 local results2 = fuzzy.filter({ "abc", "abd" }, "ab")
+
+-- Matched-char byte columns (1-based, ascending) of a query inside ONE candidate —
+-- the exact alignment the scorer credits, for highlighting a menu's VISIBLE rows.
+-- Pure Lua on every backend (identical result either way); nil on a non-match.
+local cols = fuzzy.positions("getClient", "gc")
 
 -- Introspection (used by :checkhealth):
 fuzzy.backend() -- "native-avx2" | "native-scalar" | "lua"
 fuzzy.native_loaded() -- boolean
 fuzzy.library_path() -- string|nil
-fuzzy.abi() -- integer (ABI this Lua expects)
+fuzzy.abi() -- integer (highest ABI this Lua understands)
+fuzzy.has_append() -- boolean (library supports incremental append, ABI >= 2)
 ```
+
+## Incremental append
+
+For a growing pool (e.g. a picker streaming results), `append` extends a prepared
+context **in place** — it builds only the new candidates' byte offsets, 32-bit
+signatures and lengths; the existing entries are never re-scanned. `match(ctx)`
+then ranks the whole grown set, and the result is **byte-identical** to
+`prepare(old ++ new)`.
+
+The cost is proportional to the number of NEW candidates, not the pool size —
+appending 5,000 candidates is ~constant regardless of how large the pool already
+is, whereas a full re-prepare scales with the total:
+
+| base pool | `append(+5000)` | full re-prepare | saving |
+|---|---|---|---|
+| 200,000 | 0.32 ms | 7.3 ms | ~23× |
+| 1,500,000 | 0.39 ms | 51.8 ms | ~134× |
+
+(Requires the native backend at ABI ≥ 2; without it — a pure-Lua backend, or an
+older library — `append` still produces identical results, falling back to a full
+re-prepare on the next match.)
 
 ## Backends & correctness
 

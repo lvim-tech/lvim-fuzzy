@@ -624,6 +624,34 @@ thread_local! {
     static CTX: RefCell<Ctx> = const { RefCell::new(Ctx::new()) };
 }
 
+/// Append `n` candidates (their own blob + 0-based `offsets`, n+1 entries) to `c`
+/// IN PLACE — extends the SoA blob/offs/sigs/lens with only the new candidates'
+/// data; existing entries are never re-scanned. This is the core shared by both
+/// `prepare` (which clears first) and `append`, so the resulting context is
+/// byte-identical whether a set was prepared whole or grown incrementally.
+fn ctx_append(c: &mut Ctx, blob: &[u8], offsets: &[i32], n: usize) {
+    if c.offs.is_empty() {
+        c.offs.push(0); // leading 0 = start of the first candidate
+    }
+    let base = c.blob.len() as i32; // global byte offset the new blob starts at
+    c.blob.extend_from_slice(blob);
+    c.sigs.reserve(n);
+    c.lens.reserve(n);
+    c.offs.reserve(n);
+    for i in 0..n {
+        let s = offsets[i] as usize;
+        let e = offsets[i + 1] as usize;
+        c.offs.push(base + offsets[i + 1]); // absolute END offset of candidate i
+        let mut m = 0u32;
+        for &bb in &blob[s..e] {
+            m |= sig_byte(bb);
+        }
+        c.sigs.push(m);
+        c.lens.push((e - s) as u32);
+    }
+    c.n += n;
+}
+
 /// Build the per-completion context ONCE (candidate set fixed; needle varies per
 /// keystroke): copies the blob + offsets and precomputes a byte signature + length
 /// per candidate. Returns n.
@@ -644,27 +672,55 @@ pub unsafe extern "C" fn lvimfuzzy_prepare(hay: *const u8, offs: *const i32, n: 
         CTX.with(|cell| {
             let mut c = cell.borrow_mut();
             c.blob.clear();
-            c.blob.extend_from_slice(blob);
             c.offs.clear();
-            c.offs.extend_from_slice(offsets);
             c.sigs.clear();
             c.lens.clear();
-            c.sigs.reserve(n);
-            c.lens.reserve(n);
-            for i in 0..n {
-                let s = offsets[i] as usize;
-                let e = offsets[i + 1] as usize;
-                let mut m = 0u32;
-                for &bb in &blob[s..e] {
-                    m |= sig_byte(bb);
-                }
-                c.sigs.push(m);
-                c.lens.push((e - s) as u32);
-            }
-            c.n = n;
+            c.n = 0;
+            ctx_append(&mut c, blob, offsets, n);
         });
         n as i32
     }
+}
+
+/// Append `n` NEW candidates (their own blob + n+1 offsets) to the ACTIVE prepared
+/// context, extending it in place — only the new candidates are scanned, the
+/// existing entries are untouched. Returns the new total candidate count. A
+/// subsequent match() ranks the whole grown set. (ABI ≥ 2.)
+///
+/// # Safety
+/// `hay`/`offs` must be valid for the stated lengths (offsets has n+1 elements,
+/// blob length == offsets[n]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lvimfuzzy_append(hay: *const u8, offs: *const i32, n: i32) -> i32 {
+    if hay.is_null() || offs.is_null() || n <= 0 {
+        return CTX.with(|cell| cell.borrow().n as i32);
+    }
+    unsafe {
+        let n = n as usize;
+        let offsets = slice::from_raw_parts(offs, n + 1);
+        let total = offsets[n] as usize;
+        let blob = slice::from_raw_parts(hay, total);
+        CTX.with(|cell| {
+            let mut c = cell.borrow_mut();
+            ctx_append(&mut c, blob, offsets, n);
+            c.n as i32
+        })
+    }
+}
+
+/// Free the active prepared context's memory (clears + releases the SoA Vecs).
+/// Optional — a consumer that has finished with a large pool can reclaim it
+/// eagerly instead of waiting for the next `prepare` to overwrite it. (ABI ≥ 2.)
+#[unsafe(no_mangle)]
+pub extern "C" fn lvimfuzzy_ctx_free() {
+    CTX.with(|cell| {
+        let mut c = cell.borrow_mut();
+        c.blob = Vec::new();
+        c.offs = Vec::new();
+        c.sigs = Vec::new();
+        c.lens = Vec::new();
+        c.n = 0;
+    });
 }
 
 /// Core prepared match (shared by the SIMD and scalar-forced entry points).
@@ -852,11 +908,13 @@ unsafe fn match_prepared_impl(
 }
 
 // ─── C ABI (loaded from Lua via LuaJIT FFI) ──────────────────────────────────
-/// ABI version gate — the Lua loader refuses a .so whose ABI differs from the
-/// version it was written against and falls back to the pure-Lua matcher.
+/// ABI version. The base contract (prepare / match_prepared / match / avx2) is
+/// ABI ≥ 1; incremental `append` + `ctx_free` were added in ABI 2. The loader
+/// accepts any ABI ≥ 1 (existing consumers keep working on this newer .so) and
+/// exposes the ABI-2 features only when this reports ≥ 2.
 #[unsafe(no_mangle)]
 pub extern "C" fn lvimfuzzy_abi() -> i32 {
-    1
+    2
 }
 
 /// 1 if the running CPU has AVX2 (the inter-candidate SIMD tile path is active),
@@ -1032,6 +1090,63 @@ mod tests {
                     &s2[..n2],
                     "SCORES differ (size {size}, query {q:?})"
                 );
+            }
+        }
+    }
+
+    /// Concatenated bytes + (n+1) offsets for a candidate slice (the shape the
+    /// FFI prepare/append receive).
+    fn blob_offs(cands: &[String]) -> (Vec<u8>, Vec<i32>) {
+        let mut blob = Vec::new();
+        let mut offs = vec![0i32];
+        for c in cands {
+            blob.extend_from_slice(c.as_bytes());
+            offs.push(blob.len() as i32);
+        }
+        (blob, offs)
+    }
+
+    /// prepare(A) then append(B) must yield a context whose SoA arrays AND whose
+    /// match() output are byte-identical to prepare(A ++ B), for every split and
+    /// every query.
+    #[test]
+    fn append_equals_prepare_whole() {
+        let queries = [
+            "f", "co", "buf", "conf", "gtcl", "handler", "get", "s", "cs", "cfg", "zzzz", "client",
+        ];
+        let all = gen_cands(6000);
+        for split in [0usize, 1, 17, 256, 3000, 5999, 6000] {
+            // incremental: empty ctx, append A, then append B
+            let mut inc = Ctx::new();
+            let (ab, ao) = blob_offs(&all[..split]);
+            if split > 0 {
+                ctx_append(&mut inc, &ab, &ao, split);
+            }
+            let (bb, bo) = blob_offs(&all[split..]);
+            if split < all.len() {
+                ctx_append(&mut inc, &bb, &bo, all.len() - split);
+            }
+            // whole
+            let whole = build_ctx(&all);
+            // SoA identity
+            assert_eq!(inc.n, whole.n, "n (split {split})");
+            assert_eq!(inc.blob, whole.blob, "blob (split {split})");
+            assert_eq!(inc.offs, whole.offs, "offs (split {split})");
+            assert_eq!(inc.sigs, whole.sigs, "sigs (split {split})");
+            assert_eq!(inc.lens, whole.lens, "lens (split {split})");
+            // match-output identity for every query
+            let mut b1 = Bufs::new();
+            let mut b2 = Bufs::new();
+            for q in queries {
+                let cap = whole.n;
+                let (mut i1, mut s1) = (vec![0i32; cap], vec![0i32; cap]);
+                let (mut i2, mut s2) = (vec![0i32; cap], vec![0i32; cap]);
+                let n1 = prepared_run(&inc, &mut b1, q.as_bytes(), true, &mut i1, &mut s1) as usize;
+                let n2 =
+                    prepared_run(&whole, &mut b2, q.as_bytes(), true, &mut i2, &mut s2) as usize;
+                assert_eq!(n1, n2, "count q={q:?} split={split}");
+                assert_eq!(&i1[..n1], &i2[..n2], "idx q={q:?} split={split}");
+                assert_eq!(&s1[..n1], &s2[..n2], "score q={q:?} split={split}");
             }
         }
     }

@@ -15,6 +15,7 @@
 --   • require("lvim-fuzzy").prepare(candidates) → ctx   (build once per set)
 --   • require("lvim-fuzzy").match(query, ctx)   → results, count  (per keystroke)
 --   • require("lvim-fuzzy").filter(candidates, query) → results, count  (one-off)
+--   • require("lvim-fuzzy").positions(candidate, query) → cols?  (visible rows only)
 --   • require("lvim-fuzzy").backend()  → "native-avx2" | "native-scalar" | "lua"
 --
 ---@module "lvim-fuzzy"
@@ -25,14 +26,19 @@ local fallback = require("lvim-fuzzy.fallback")
 
 local M = {}
 
--- ABI version this Lua was written against. The loader refuses a .so reporting a
--- different value (a stale/incompatible build) and uses the Lua fallback instead.
-local ABI = 1
+-- ABI contract. The BASE contract (prepare / match_prepared / match / avx2) is
+-- ABI ≥ 1; incremental `append` + `ctx_free` arrived in ABI 2. The loader accepts
+-- any library reporting ABI ≥ ABI_MIN (so an older ABI-1 .so still loads and works)
+-- and exposes the ABI-2 features only when the library reports ≥ ABI_APPEND.
+local ABI_MIN = 1
+local ABI_APPEND = 2
 
 ffi.cdef([[
 int lvimfuzzy_abi(void);
 int lvimfuzzy_avx2(void);
 int lvimfuzzy_prepare(const char *hay, const int *offs, int n);
+int lvimfuzzy_append(const char *hay, const int *offs, int n);
+void lvimfuzzy_ctx_free(void);
 int lvimfuzzy_match_prepared(const char *needle, int needle_len,
                              int *out_idx, int *out_score, int max_out);
 int lvimfuzzy_match(const char *hay, const int *offs, int n,
@@ -44,6 +50,10 @@ int lvimfuzzy_match(const char *hay, const int *offs, int n,
 local lib
 ---@type string? absolute path the library was loaded from
 local lib_path
+---@type integer? the loaded library's reported ABI
+local lib_abi
+---@type boolean whether the loaded library supports incremental append (ABI ≥ 2)
+local has_append = false
 ---@type boolean whether load_native() has run
 local probed = false
 ---@type boolean one-shot guard for the fallback notification
@@ -90,9 +100,11 @@ local function load_native()
                 local abi_ok, abi = pcall(function()
                     return loaded.lvimfuzzy_abi()
                 end)
-                if abi_ok and abi == ABI then
+                if abi_ok and abi >= ABI_MIN then
                     lib = loaded
                     lib_path = p
+                    lib_abi = abi
+                    has_append = abi >= ABI_APPEND
                     return lib
                 end
             end
@@ -155,44 +167,96 @@ local function maybe_warn_fallback()
     end
 end
 
+--- Build the concatenated blob + (n+1) offsets for `count` candidates starting at
+--- `from` (1-based) in `candidates` — the shape native prepare/append receive.
+---@param candidates string[]
+---@param from integer
+---@param count integer
+---@return string blob, ffi.cdata* offs
+local function build_blob(candidates, from, count)
+    local parts = {}
+    local offs = ffi.new("int[?]", count + 1)
+    local pos = 0
+    for i = 1, count do
+        offs[i - 1] = pos
+        local s = candidates[from + i - 1]
+        parts[i] = s
+        pos = pos + #s
+    end
+    offs[count] = pos
+    return table.concat(parts), offs
+end
+
+--- Native-prepare the WHOLE current candidate set of `ctx` and mark it active.
+--- Re-derives the blob from ctx.candidates so it is always current (correct even
+--- after appends made while another context was active).
+---@param ctx LvimFuzzyContext
+local function upload_ctx(ctx)
+    if not lib then
+        return
+    end
+    local blob, offs = build_blob(ctx.candidates, 1, ctx.n)
+    lib.lvimfuzzy_prepare(blob, offs, ctx.n)
+    active_token = ctx.token
+end
+
 -- ─── public API ──────────────────────────────────────────────────────────────
 
---- Build a matching context for a fixed candidate set. Do this ONCE per
---- completion / pick; then call `match(query, ctx)` on every keystroke.
+--- Build a matching context for a candidate set. Do this ONCE per completion /
+--- pick; then call `match(query, ctx)` on every keystroke. The set can grow with
+--- `append(ctx, more)` without rebuilding what is already there.
 ---@param candidates string[]  the haystack (searched by their bytes)
 ---@return LvimFuzzyContext
 function M.prepare(candidates)
-    local n = #candidates
     ---@class LvimFuzzyContext
-    ---@field candidates string[]
-    ---@field n integer
-    ---@field native boolean
-    ---@field token integer
-    ---@field blob? string
-    ---@field offs? ffi.cdata*
-    local ctx = { candidates = candidates, n = n, native = false, token = 0 }
+    ---@field candidates string[]  the full (growable) candidate list
+    ---@field n integer            number of candidates
+    ---@field native boolean       whether this ctx uses the native backend
+    ---@field token integer        identity for the single-active-slot re-upload
+    local ctx = { candidates = candidates, n = #candidates, native = false, token = 0 }
 
     if load_native() and lib then
-        -- concatenated bytes + (n+1) offsets; native prepare COPIES the blob
-        local blob = table.concat(candidates)
-        local offs = ffi.new("int[?]", n + 1)
-        local pos = 0
-        for i = 1, n do
-            offs[i - 1] = pos
-            pos = pos + #candidates[i]
-        end
-        offs[n] = pos
         token_seq = token_seq + 1
         ctx.native = true
         ctx.token = token_seq
-        ctx.blob = blob
-        ctx.offs = offs
-        lib.lvimfuzzy_prepare(blob, offs, n)
-        active_token = ctx.token
+        upload_ctx(ctx) -- native prepare COPIES the blob; nothing kept Lua-side
     else
         maybe_warn_fallback()
     end
     return ctx
+end
+
+--- Append NEW candidates to an existing context, extending it INCREMENTALLY:
+--- only the new candidates' data is built (native side: their offsets/signatures/
+--- lengths are appended in place — the existing pool is never re-scanned). A
+--- subsequent `match` ranks the whole grown set. Result is byte-identical to a
+--- `prepare(old ++ new)`.
+---@param ctx LvimFuzzyContext
+---@param candidates string[]  the new candidates to add
+---@return integer count  the new total candidate count
+function M.append(ctx, candidates)
+    local add = #candidates
+    if add == 0 then
+        return ctx.n
+    end
+    -- extend the Lua-side list (used by the fallback and by any whole re-upload)
+    local new_n = fallback.append(ctx.candidates, candidates)
+    local first_new = ctx.n + 1
+    ctx.n = new_n
+
+    if ctx.native and lib then
+        if has_append and active_token == ctx.token then
+            -- fast path: build ONLY the new candidates and extend the native SoA
+            local blob, offs = build_blob(ctx.candidates, first_new, add)
+            lib.lvimfuzzy_append(blob, offs, add)
+            -- native now holds the grown set; ctx stays the active slot
+        elseif active_token == ctx.token then
+            -- library too old for incremental append → force a whole re-upload next match
+            active_token = nil
+        end
+        -- (ctx not active → active_token already ≠ ctx.token → match() re-uploads whole)
+    end
+    return ctx.n
 end
 
 --- Rank `ctx`'s candidates against `query`. Returns a list of
@@ -206,10 +270,10 @@ function M.match(query, ctx)
     if not ctx.native or not lib then
         return fallback.match(ctx.candidates, query, config.max_results or 0)
     end
-    -- re-upload this set if another ctx became active since it was prepared
-    if active_token ~= ctx.token and ctx.blob and ctx.offs then
-        lib.lvimfuzzy_prepare(ctx.blob, ctx.offs, ctx.n)
-        active_token = ctx.token
+    -- re-upload the whole (current) set if another ctx became active since this one
+    -- was prepared, or after an append made while it was not the active slot
+    if active_token ~= ctx.token then
+        upload_ctx(ctx)
     end
     local cap = result_cap(ctx.n)
     local oi, os = ensure_out(math.max(cap, 1))
@@ -252,6 +316,32 @@ function M.filter(candidates, query)
     return out, cnt
 end
 
+--- Matched-char BYTE columns (1-based, ascending) of `query` inside `candidate` —
+--- the exact alignment the scorer credits, so highlighted chars always agree with the
+--- ranking. Computed in Lua on EVERY backend (both share the constants/recurrence, so
+--- the result is identical either way): a menu needs positions only for its ~12
+--- VISIBLE rows, which is far below FFI-crossing weight. Returns nil on a non-match.
+---@param candidate string
+---@param query string
+---@return integer[]?
+function M.positions(candidate, query)
+    return fallback.positions(candidate, query)
+end
+
+--- Release a context. On the native backend, if `ctx` is the active slot this
+--- frees the native SoA memory eagerly (a large pool can be reclaimed instead of
+--- lingering until the next `prepare`). The Lua-side lists are dropped by GC once
+--- the caller lets `ctx` go. Optional — not calling it is harmless.
+---@param ctx LvimFuzzyContext
+function M.free(ctx)
+    if ctx.native and lib and has_append and active_token == ctx.token then
+        lib.lvimfuzzy_ctx_free()
+        active_token = nil
+    end
+    ctx.candidates = {}
+    ctx.n = 0
+end
+
 -- ─── introspection (used by health.lua and consumers) ────────────────────────
 
 --- Which backend is active: "native-avx2", "native-scalar", or "lua".
@@ -276,10 +366,23 @@ function M.library_path()
     return lib_path
 end
 
---- The ABI version this Lua expects.
+--- The highest ABI version this Lua understands (the base contract is ABI_MIN).
 ---@return integer
 function M.abi()
-    return ABI
+    return ABI_APPEND
+end
+
+--- The minimum ABI the loader accepts.
+---@return integer
+function M.abi_min()
+    return ABI_MIN
+end
+
+--- Whether the loaded native library supports incremental append (ABI ≥ 2).
+---@return boolean
+function M.has_append()
+    load_native()
+    return has_append
 end
 
 --- The native library's reported ABI (nil when not loaded).
@@ -306,6 +409,8 @@ function M.setup(opts)
     probed = false
     lib = nil
     lib_path = nil
+    lib_abi = nil
+    has_append = false
     active_token = nil
 end
 

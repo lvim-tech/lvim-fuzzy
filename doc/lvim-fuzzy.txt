@@ -80,10 +80,33 @@ require("lvim-fuzzy").match({query}, {ctx})            → results, count
     `{ index = <1-based index into candidates>, score = <integer> }` in ranked
     order, and the count. Call it on every keystroke — it is one FFI call.
 
+                                                         *lvim-fuzzy.append()*
+require("lvim-fuzzy").append({ctx}, {candidates})     → count
+    Append NEW candidates to an existing context, extending it INCREMENTALLY:
+    only the new candidates are built (their offsets / signatures / lengths are
+    appended in place; the existing pool is never re-scanned). A subsequent
+    |lvim-fuzzy.match| ranks the whole grown set, and the result is
+    byte-identical to `prepare(old ++ new)`. The cost is proportional to the
+    number of NEW candidates, not the pool size (see |lvim-fuzzy-append|).
+    Returns the new total count.
+
+                                                           *lvim-fuzzy.free()*
+require("lvim-fuzzy").free({ctx})
+    Release a context. On the native backend, if `ctx` is the active slot its
+    SoA memory is freed eagerly. Optional — not calling it is harmless.
+
                                                          *lvim-fuzzy.filter()*
 require("lvim-fuzzy").filter({candidates}, {query})    → results, count
     One-off stateless rank (prepare + match in a single call) for callers that
     do not keep a context. Does not disturb an active prepared context.
+
+                                                      *lvim-fuzzy.positions()*
+require("lvim-fuzzy").positions({candidate}, {query})  → cols|nil
+    Matched-char BYTE columns (1-based, ascending) of `query` inside ONE
+    candidate — the exact alignment the scorer credits, so highlighted chars
+    always agree with the ranking. Intended for a menu's few VISIBLE rows.
+    Computed in Lua on every backend (both share the constants/recurrence, so
+    the result is identical either way). Returns nil on a non-match.
 
                                                         *lvim-fuzzy.backend()*
 require("lvim-fuzzy").backend()  → "native-avx2" | "native-scalar" | "lua"
@@ -98,7 +121,31 @@ Example: >lua
     for _, r in ipairs(results) do
         print(r.index, r.score)
     end
+    -- grow the pool cheaply; the existing entries are not rebuilt
+    fuzzy.append(ctx, { "getConfig", "get_client" })
 <
+                                                          *lvim-fuzzy-append*
+Incremental append ~
+
+For a growing pool (a picker streaming results, a completion source that keeps
+discovering words), |lvim-fuzzy.append| extends a prepared context in place and
+builds ONLY the new candidates' data — the existing pool's offsets, signatures
+and lengths are never touched. So the cost is proportional to the number of NEW
+candidates, not the pool size: appending 5,000 candidates is roughly constant
+whether the pool holds 200,000 or 1,500,000, while a full re-prepare scales with
+the total. Measured (native, AVX2):
+
+    base pool     append(+5000)    full re-prepare    saving
+    200,000       0.32 ms          7.3 ms             ~23x
+    1,500,000     0.39 ms          51.8 ms            ~134x
+
+The result of prepare(A) then append(B) is byte-identical (same indices, scores
+and order) to prepare(A ++ B), on every backend — asserted by a Rust test
+(`append_equals_prepare_whole`) and a headless native-vs-Lua-vs-whole cross
+check. Incremental append needs the native backend at ABI >= 2; a pure-Lua
+backend or an older library still returns identical results, falling back to a
+full re-prepare on the next match.
+
 ==============================================================================
 4. BACKENDS & CORRECTNESS                                *lvim-fuzzy-backends*
 
