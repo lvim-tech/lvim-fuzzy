@@ -515,6 +515,23 @@ fn radix_finalize(b: &mut Bufs, out_i: &mut [i32], out_s: &mut [i32]) -> i32 {
     cnt as i32
 }
 
+/// Fold per-candidate score offsets into the hits BEFORE ranking (ABI 6). `boosts[idx]` is
+/// added to candidate `idx`'s match score, letting a caller (lvim-cmp) bias the fuzzy order
+/// with signals that live outside the string match — exact-prefix, proximity, frecency —
+/// while still respecting the fuzzy score. Indices past the slice stay unboosted; the add
+/// saturates so an extreme boost can never wrap the score.
+#[inline]
+fn apply_boosts(hits: &mut [Hit], boosts: Option<&[i32]>) {
+    if let Some(bo) = boosts {
+        for h in hits.iter_mut() {
+            let idx = h.0 as usize;
+            if idx < bo.len() {
+                h.1 = h.1.saturating_add(bo[idx]);
+            }
+        }
+    }
+}
+
 // ─── orchestration ───────────────────────────────────────────────────────────
 #[inline]
 fn run_match(
@@ -1072,6 +1089,7 @@ fn prepared_run(
     b: &mut Bufs,
     needle: &[u8],
     use_simd: bool,
+    boosts: Option<&[i32]>,
     out_i: &mut [i32],
     out_s: &mut [i32],
 ) -> i32 {
@@ -1081,6 +1099,8 @@ fn prepared_run(
     let nlen = b.lc_needle.len();
     let cap = out_i.len();
     if nlen == 0 {
+        // empty query = source order (no scoring), so boosts do not reorder here — they refine
+        // the SCORED ranking; an unqueried menu keeps its server/sort-text order.
         let k = cap.min(c.n);
         for i in 0..k {
             out_i[i] = i as i32;
@@ -1098,6 +1118,7 @@ fn prepared_run(
     let lc_needle: &[u8] = unsafe { slice::from_raw_parts(b.lc_needle.as_ptr(), nlen) };
 
     scan_range(c, b, lc_needle, nsig, use_simd, 0, c.n);
+    apply_boosts(&mut b.hits, boosts);
     radix_finalize(b, out_i, out_s)
 }
 
@@ -1265,8 +1286,47 @@ unsafe fn match_prepared_impl(
         CTX.with(|ccell| {
             let c = ccell.borrow();
             BUFS.with(|bcell| {
-                prepared_run(&c, &mut bcell.borrow_mut(), needle, use_simd, out_i, out_s)
+                prepared_run(&c, &mut bcell.borrow_mut(), needle, use_simd, None, out_i, out_s)
             })
+        })
+    }
+}
+
+/// BOOSTED prepared match (ABI 6): same single-threaded prepared scan as
+/// `lvimfuzzy_match_prepared`, but a per-candidate `boosts` array (length = the prepared
+/// candidate count) is added to each match score before ranking. Used by lvim-cmp to fold
+/// exact-prefix / proximity / frecency signals into the fuzzy order. A null / empty boosts
+/// pointer is identical to the plain entry point.
+///
+/// # Safety
+/// `needle` valid for `needle_len`; `boosts` valid for `boosts_len` (or null); out arrays
+/// hold `max_out` elements. Called after `lvimfuzzy_prepare` on the same thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lvimfuzzy_match_prepared_boost(
+    needle: *const u8,
+    needle_len: i32,
+    boosts: *const i32,
+    boosts_len: i32,
+    out_idx: *mut i32,
+    out_score: *mut i32,
+    max_out: i32,
+) -> i32 {
+    if needle.is_null() || out_idx.is_null() || out_score.is_null() || max_out <= 0 {
+        return 0;
+    }
+    unsafe {
+        let needle = slice::from_raw_parts(needle, needle_len.max(0) as usize);
+        let cap = max_out as usize;
+        let out_i = slice::from_raw_parts_mut(out_idx, cap);
+        let out_s = slice::from_raw_parts_mut(out_score, cap);
+        let boosts = if boosts.is_null() || boosts_len <= 0 {
+            None
+        } else {
+            Some(slice::from_raw_parts(boosts, boosts_len as usize))
+        };
+        CTX.with(|ccell| {
+            let c = ccell.borrow();
+            BUFS.with(|bcell| prepared_run(&c, &mut bcell.borrow_mut(), needle, true, boosts, out_i, out_s))
         })
     }
 }
@@ -1373,7 +1433,7 @@ pub unsafe extern "C" fn lvimfuzzy_match_chunk_finish(out_idx: *mut i32, out_sco
 /// .so) and exposes each tier's features only when this reports at or above it.
 #[unsafe(no_mangle)]
 pub extern "C" fn lvimfuzzy_abi() -> i32 {
-    5
+    6
 }
 
 /// 1 if the running CPU has AVX2 (the inter-candidate SIMD tile path is active),
@@ -1536,9 +1596,9 @@ mod tests {
                 let cap = ctx.n;
                 let (mut i1, mut s1) = (vec![0i32; cap], vec![0i32; cap]);
                 let (mut i2, mut s2) = (vec![0i32; cap], vec![0i32; cap]);
-                let n1 = prepared_run(&ctx, &mut b1, q.as_bytes(), true, &mut i1, &mut s1) as usize;
+                let n1 = prepared_run(&ctx, &mut b1, q.as_bytes(), true, None, &mut i1, &mut s1) as usize;
                 let n2 =
-                    prepared_run(&ctx, &mut b2, q.as_bytes(), false, &mut i2, &mut s2) as usize;
+                    prepared_run(&ctx, &mut b2, q.as_bytes(), false, None, &mut i2, &mut s2) as usize;
                 assert_eq!(n1, n2, "match COUNT differs (size {size}, query {q:?})");
                 assert_eq!(
                     &i1[..n1],
@@ -1601,9 +1661,9 @@ mod tests {
                 let cap = whole.n;
                 let (mut i1, mut s1) = (vec![0i32; cap], vec![0i32; cap]);
                 let (mut i2, mut s2) = (vec![0i32; cap], vec![0i32; cap]);
-                let n1 = prepared_run(&inc, &mut b1, q.as_bytes(), true, &mut i1, &mut s1) as usize;
+                let n1 = prepared_run(&inc, &mut b1, q.as_bytes(), true, None, &mut i1, &mut s1) as usize;
                 let n2 =
-                    prepared_run(&whole, &mut b2, q.as_bytes(), true, &mut i2, &mut s2) as usize;
+                    prepared_run(&whole, &mut b2, q.as_bytes(), true, None, &mut i2, &mut s2) as usize;
                 assert_eq!(n1, n2, "count q={q:?} split={split}");
                 assert_eq!(&i1[..n1], &i2[..n2], "idx q={q:?} split={split}");
                 assert_eq!(&s1[..n1], &s2[..n2], "score q={q:?} split={split}");
@@ -1665,7 +1725,7 @@ mod tests {
             for q in queries {
                 let cap = 1000usize;
                 let (mut wi, mut ws) = (vec![0i32; cap], vec![0i32; cap]);
-                let wn = prepared_run(&c, &mut b1, q.as_bytes(), true, &mut wi, &mut ws) as usize;
+                let wn = prepared_run(&c, &mut b1, q.as_bytes(), true, None, &mut wi, &mut ws) as usize;
                 for &budget in &[1usize, 7, 128, 1000, 99_999, n] {
                     let (mut ci, mut cs) = (vec![0i32; cap], vec![0i32; cap]);
                     let cn = chunked_run(&c, &mut b2, q.as_bytes(), true, budget, &mut ci, &mut cs) as usize;
@@ -1695,7 +1755,7 @@ mod tests {
             for q in queries {
                 let cap = 1000usize;
                 let (mut wi, mut ws) = (vec![0i32; cap], vec![0i32; cap]);
-                let wn = prepared_run(&c, &mut b1, q.as_bytes(), true, &mut wi, &mut ws) as usize;
+                let wn = prepared_run(&c, &mut b1, q.as_bytes(), true, None, &mut wi, &mut ws) as usize;
                 let (mut pi, mut ps) = (vec![0i32; cap], vec![0i32; cap]);
                 let (pw, ptot) = parallel_prepared_run(&c, &mut b2, q.as_bytes(), true, &mut pi, &mut ps);
                 let pn = pw as usize;
@@ -1758,8 +1818,8 @@ mod tests {
                     let cap = 1000usize;
                     let (mut i1, mut s1) = (vec![0i32; cap], vec![0i32; cap]);
                     let (mut i2, mut s2) = (vec![0i32; cap], vec![0i32; cap]);
-                    let n1 = prepared_run(&inc, &mut b1, q.as_bytes(), true, &mut i1, &mut s1) as usize;
-                    let n2 = prepared_run(&whole, &mut b2, q.as_bytes(), true, &mut i2, &mut s2) as usize;
+                    let n1 = prepared_run(&inc, &mut b1, q.as_bytes(), true, None, &mut i1, &mut s1) as usize;
+                    let n2 = prepared_run(&whole, &mut b2, q.as_bytes(), true, None, &mut i2, &mut s2) as usize;
                     assert_eq!(n1, n2, "count q={q:?} chunk={chunk}");
                     assert_eq!(&i1[..n1], &i2[..n2], "idx q={q:?} chunk={chunk}");
                     assert_eq!(&s1[..n1], &s2[..n2], "score q={q:?} chunk={chunk}");
@@ -1798,5 +1858,40 @@ mod tests {
         assert_eq!(read(0), "alpha");
         assert_eq!(read(1), "beta");
         assert_eq!(read(2), "gamma");
+    }
+
+    /// Boosts fold into the score before ranking: a null / all-zero boost is byte-identical
+    /// to the plain match, and a large positive boost promotes its candidate to the top
+    /// without changing the match SET.
+    #[test]
+    fn boost_reorders_and_zero_is_plain() {
+        let cands: Vec<String> =
+            vec!["getBuffer".into(), "bunchOfStuff".into(), "abufoo".into(), "cfg".into()];
+        let ctx = build_ctx(&cands);
+        let q = b"buf";
+        let cap = ctx.n;
+
+        // plain (None) == all-zeros boost, in both index order and scores
+        let mut bp = Bufs::new();
+        let (mut ip, mut sp) = (vec![0i32; cap], vec![0i32; cap]);
+        let np = prepared_run(&ctx, &mut bp, q, true, None, &mut ip, &mut sp) as usize;
+
+        let zeros = vec![0i32; ctx.n];
+        let mut bz = Bufs::new();
+        let (mut iz, mut sz) = (vec![0i32; cap], vec![0i32; cap]);
+        let nz = prepared_run(&ctx, &mut bz, q, true, Some(&zeros), &mut iz, &mut sz) as usize;
+        assert_eq!(&ip[..np], &iz[..nz], "zero boosts must match the plain order");
+        assert_eq!(&sp[..np], &sz[..nz], "zero boosts must match the plain scores");
+
+        // hugely boost the LAST-ranked match → it must rank first, set unchanged
+        assert!(np >= 2, "need at least two matches for the reorder check");
+        let underdog = ip[np - 1];
+        let mut boosts = vec![0i32; ctx.n];
+        boosts[underdog as usize] = 10_000;
+        let mut bb = Bufs::new();
+        let (mut ib, mut sb) = (vec![0i32; cap], vec![0i32; cap]);
+        let nb = prepared_run(&ctx, &mut bb, q, true, Some(&boosts), &mut ib, &mut sb) as usize;
+        assert_eq!(nb, np, "a boost must not change the match SET (same count)");
+        assert_eq!(ib[0], underdog, "a huge boost must rank the boosted candidate first");
     }
 }

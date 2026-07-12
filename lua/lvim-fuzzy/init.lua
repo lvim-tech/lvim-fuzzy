@@ -35,6 +35,7 @@ local ABI_APPEND = 2
 local ABI_CHUNK = 3
 local ABI_PAR = 4
 local ABI_BLOB = 5
+local ABI_BOOST = 6
 
 ffi.cdef([[
 int lvimfuzzy_abi(void);
@@ -52,6 +53,9 @@ int lvimfuzzy_match_chunk_step(int budget);
 int lvimfuzzy_match_chunk_finish(int *out_idx, int *out_score, int max_out);
 int lvimfuzzy_match_prepared_par(const char *needle, int needle_len,
                                  int *out_idx, int *out_score, int max_out);
+int lvimfuzzy_match_prepared_boost(const char *needle, int needle_len,
+                                   const int *boosts, int boosts_len,
+                                   int *out_idx, int *out_score, int max_out);
 int lvimfuzzy_ctx_new(void);
 int lvimfuzzy_ctx_append_blob(int id, const char *data, int len);
 int lvimfuzzy_ctx_flush(int id);
@@ -76,6 +80,8 @@ local has_chunk = false
 local has_par = false
 ---@type boolean whether the loaded library supports handle-addressed blob-ingest contexts (ABI ≥ 5)
 local has_blob = false
+---@type boolean whether the loaded library supports the boosted prepared match (ABI ≥ 6)
+local has_boost = false
 ---@type boolean whether load_native() has run
 local probed = false
 ---@type boolean one-shot guard for the fallback notification
@@ -130,6 +136,7 @@ local function load_native()
                     has_chunk = abi >= ABI_CHUNK
                     has_par = abi >= ABI_PAR
                     has_blob = abi >= ABI_BLOB
+                    has_boost = abi >= ABI_BOOST
                     return lib
                 end
             end
@@ -289,9 +296,13 @@ end
 --- order, plus the count. Deterministic; identical across backends.
 ---@param query string
 ---@param ctx LvimFuzzyContext
+---@param boosts integer[]?  per-candidate score offsets (1-based, parallel to the prepared
+---   candidate set): `boosts[i]` is ADDED to candidate i's match score before ranking, so a
+---   caller (lvim-cmp) can fold exact-prefix / proximity / frecency signals into the fuzzy
+---   order. Applied only on the native ABI ≥ 6 library; ignored on the pure-Lua fallback.
 ---@return { index: integer, score: integer }[] results
 ---@return integer count
-function M.match(query, ctx)
+function M.match(query, ctx, boosts)
     if not ctx.native or not lib then
         return fallback.match(ctx.candidates, query, config.max_results or 0)
     end
@@ -302,7 +313,18 @@ function M.match(query, ctx)
     end
     local cap = result_cap(ctx.n)
     local oi, os = ensure_out(math.max(cap, 1))
-    local cnt = lib.lvimfuzzy_match_prepared(query, #query, oi, os, cap)
+    local cnt
+    if boosts and has_boost then
+        -- copy the Lua boost array into a native int32 buffer (parallel to the candidate set)
+        local nb = ctx.n
+        local bbuf = ffi.new("int32_t[?]", math.max(nb, 1))
+        for i = 1, nb do
+            bbuf[i - 1] = boosts[i] or 0
+        end
+        cnt = lib.lvimfuzzy_match_prepared_boost(query, #query, bbuf, nb, oi, os, cap)
+    else
+        cnt = lib.lvimfuzzy_match_prepared(query, #query, oi, os, cap)
+    end
     local out = {}
     for k = 1, cnt do
         out[k] = { index = oi[k - 1] + 1, score = os[k - 1] }
@@ -646,7 +668,7 @@ end
 --- The highest ABI version this Lua understands (the base contract is ABI_MIN).
 ---@return integer
 function M.abi()
-    return ABI_BLOB
+    return ABI_BOOST
 end
 
 --- The minimum ABI the loader accepts.
@@ -686,6 +708,15 @@ function M.has_blob()
     return has_blob
 end
 
+--- Whether the loaded native library supports the BOOSTED prepared match (ABI ≥ 6) — a
+--- per-candidate score-offset array folded in before ranking (lvim-cmp's exact-prefix /
+--- proximity boosts). Falls back to the plain match (boosts ignored) when unsupported.
+---@return boolean
+function M.has_boost()
+    load_native()
+    return has_boost
+end
+
 --- The native library's reported ABI (nil when not loaded).
 ---@return integer?
 function M.native_abi()
@@ -715,6 +746,7 @@ function M.setup(opts)
     has_chunk = false
     has_par = false
     has_blob = false
+    has_boost = false
     active_token = nil
 end
 

@@ -172,6 +172,14 @@ function M.check()
             else
                 h.info("library predates blob ingestion (ABI < 5) — streaming consumers use the per-string path")
             end
+            if fuzzy.has_boost() then
+                h.ok(
+                    "boosted match supported (ABI ≥ 6) — a per-candidate score-offset array folds exact-prefix / "
+                        .. "proximity signals into the rank before the cap (lvim-cmp)"
+                )
+            else
+                h.info("library predates boosted match (ABI < 6) — callers' boosts are ignored (plain fuzzy rank)")
+            end
         else
             h.error(("ABI too old: library reports %s, need ≥ %d"):format(tostring(nabi), fuzzy.abi_min()))
         end
