@@ -151,6 +151,27 @@ function M.check()
             else
                 h.info("library predates incremental append (ABI < 2) — append falls back to a full re-prepare")
             end
+            if fuzzy.has_chunk() then
+                h.ok("cooperative async match supported (ABI ≥ 3) — a huge-pool match never blocks the UI")
+            else
+                h.info("library predates the chunked async match (ABI < 3) — match_async runs synchronously")
+            end
+            if fuzzy.has_par() then
+                h.ok(
+                    "parallel match supported (ABI ≥ 4) — the scan fans out across CPU cores (millions of "
+                        .. "candidates in tens of ms)"
+                )
+            else
+                h.info("library predates the parallel match (ABI < 4) — match runs single-threaded / chunked")
+            end
+            if fuzzy.has_blob() then
+                h.ok(
+                    "blob ingestion supported (ABI ≥ 5) — a streaming consumer feeds raw bytes straight to the "
+                        .. "matcher (no per-candidate Lua strings; a multi-million-line pool loads without GC pauses)"
+                )
+            else
+                h.info("library predates blob ingestion (ABI < 5) — streaming consumers use the per-string path")
+            end
         else
             h.error(("ABI too old: library reports %s, need ≥ %d"):format(tostring(nabi), fuzzy.abi_min()))
         end

@@ -100,7 +100,40 @@ fuzzy.native_loaded() -- boolean
 fuzzy.library_path() -- string|nil
 fuzzy.abi() -- integer (highest ABI this Lua understands)
 fuzzy.has_append() -- boolean (library supports incremental append, ABI >= 2)
+fuzzy.has_blob() -- boolean (library supports blob ingestion, ABI >= 5)
 ```
+
+### Blob ingestion (streaming, no per-candidate Lua strings)
+
+For a consumer streaming a HUGE candidate set (e.g. a file picker over millions
+of paths), materialising every candidate as a Lua string + table is the
+bottleneck — a multi-second load of LuaJIT string-intern-table growth and GC
+pauses over the pool. The blob API removes the Lua-side pool entirely: the
+producer's raw stdout **bytes** go straight to a native context (which splits on
+`\n` and stores each line as a candidate), and the consumer materialises only the
+visible / top-K rows on demand via `blob_text`. Each context is a HANDLE in a
+native registry (not the single active prepare/match slot), so a huge pool can
+never be clobbered by another consumer preparing in between.
+
+```lua
+local b = fuzzy.blob_new() -- nil when the library predates ABI 5 (use the string path)
+fuzzy.blob_append(b, raw_stdout_chunk) -- raw bytes; split on \n natively; returns the count
+fuzzy.blob_flush(b) -- flush a final line with no trailing \n (call once at end of stream)
+fuzzy.blob_count(b) -- current candidate count
+
+-- Rank asynchronously (parallel scan, delivered on a scheduled tick — never blocks typing).
+-- results[k] = { index = <1-based native index>, score }
+fuzzy.blob_match(b, "src", function(results, count)
+    local text = fuzzy.blob_text(b, results[1].index) -- materialise a row's text on demand
+end)
+
+fuzzy.blob_free(b) -- release the native memory (recommended on close)
+```
+
+Byte-identical to preparing the same lines the offsets-based way (proven by the
+`blob_equals_prepare_whole` Rust test over every chunk boundary). Requires the
+native backend at ABI ≥ 5; `blob_new()` returns nil otherwise, and the consumer
+keeps its per-string path (gate on `fuzzy.has_blob()`).
 
 ## Incremental append
 

@@ -108,11 +108,23 @@ require("lvim-fuzzy").positions({candidate}, {query})  → cols|nil
     Computed in Lua on every backend (both share the constants/recurrence, so
     the result is identical either way). Returns nil on a non-match.
 
+                                                       *lvim-fuzzy.blob_new()*
+require("lvim-fuzzy").blob_new()  → blob|nil
+    Create a BLOB-ingest context (|lvim-fuzzy-blob|), or nil when the library
+    predates ABI 5 (the caller then keeps its per-string path). Companion calls:
+    `blob_append(b, bytes)` (raw stdout, split on \n natively → count),
+    `blob_flush(b)` (a final line with no trailing \n), `blob_count(b)`,
+    `blob_text(b, idx)` (materialise candidate `idx`'s text — 1-based),
+    `blob_match(b, query, on_result)` (async parallel rank; `on_result(results,
+    count, total)` — results carry a 1-based `index`, `total` is the TRUE match
+    count before the `max_results` cap, for an fzf-style matched/total counter),
+    `blob_free(b)`.
+
                                                         *lvim-fuzzy.backend()*
 require("lvim-fuzzy").backend()  → "native-avx2" | "native-scalar" | "lua"
 
 Other introspection: `native_loaded()`, `library_path()`, `abi()`,
-`native_abi()` — used by |lvim-fuzzy-health|.
+`native_abi()`, `has_append()`, `has_blob()` — used by |lvim-fuzzy-health|.
 
 Example: >lua
     local fuzzy = require("lvim-fuzzy")
@@ -145,6 +157,26 @@ and order) to prepare(A ++ B), on every backend — asserted by a Rust test
 check. Incremental append needs the native backend at ABI >= 2; a pure-Lua
 backend or an older library still returns identical results, falling back to a
 full re-prepare on the next match.
+
+                                                            *lvim-fuzzy-blob*
+Blob ingestion (streaming, no per-candidate Lua strings) ~
+
+For a consumer streaming a HUGE candidate set (a file picker over millions of
+paths), materialising every candidate as a Lua string + table is the real
+bottleneck — a multi-second load of LuaJIT string-intern-table growth and GC
+pauses over the pool. The blob API removes the Lua-side pool entirely: the
+producer's raw stdout BYTES are handed straight to a native context, which splits
+on \n and stores each line as a candidate; the consumer keeps only the visible /
+top-K rows, materialised on demand via |lvim-fuzzy.blob_new| `blob_text`. Each
+context is a HANDLE in a native registry (not the single active prepare/match
+slot), so a huge pool can never be clobbered by another consumer preparing in
+between (and needs no Lua-side re-upload copy).
+
+A blob-ingested set ranks byte-identically to preparing the same lines the
+offsets-based way — asserted by the Rust test `blob_equals_prepare_whole` over
+every chunk boundary (incl. mid-line splits) with and without a trailing newline.
+Requires the native backend at ABI >= 5; `blob_new()` returns nil otherwise and
+the consumer keeps its per-string path (gate on `has_blob()`).
 
 ==============================================================================
 4. BACKENDS & CORRECTNESS                                *lvim-fuzzy-backends*

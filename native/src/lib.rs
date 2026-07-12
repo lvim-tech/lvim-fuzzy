@@ -41,6 +41,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ptr;
 use std::slice;
 
 // ─── scoring constants (our own) ────────────────────────────────────────────
@@ -606,6 +608,10 @@ struct Ctx {
     sigs: Vec<u32>,
     lens: Vec<u32>,
     n: usize,
+    // Partial trailing line carried between blob-ingest chunks (ABI 5): a producer's stdout arrives in
+    // arbitrary byte chunks that may split a line, so the bytes after the last '\n' of a chunk wait here for
+    // the next chunk (or the final flush). Unused by the offsets-based prepare/append path.
+    pending: Vec<u8>,
 }
 
 impl Ctx {
@@ -616,12 +622,41 @@ impl Ctx {
             sigs: Vec::new(),
             lens: Vec::new(),
             n: 0,
+            pending: Vec::new(),
         }
     }
 }
 
 thread_local! {
     static CTX: RefCell<Ctx> = const { RefCell::new(Ctx::new()) };
+}
+
+/// Cooperative CHUNKED match state (ABI 3): the caller drives the match over `[0, n)` in slices across event
+/// loop ticks, so a huge-pool match never blocks the editor in one FFI call. `begin` records the lowercased
+/// needle + its signature and clears the hit accumulator; each `step` scans one candidate range (appending to
+/// the shared `b.hits`); `finish` radix-sorts the accumulated hits into the caller's output — byte-identical
+/// to the single-shot `match_prepared`, because `scan_range` processes candidates in index order in both, so
+/// equal `(score, len)` ties finalize in index-ascending order either way. Same thread as `prepare`.
+struct ChunkState {
+    lc_needle: Vec<u8>,
+    nsig: u32,
+    cursor: usize,
+    n: usize,
+}
+
+impl ChunkState {
+    const fn new() -> Self {
+        ChunkState {
+            lc_needle: Vec::new(),
+            nsig: 0,
+            cursor: 0,
+            n: 0,
+        }
+    }
+}
+
+thread_local! {
+    static CHUNK: RefCell<ChunkState> = const { RefCell::new(ChunkState::new()) };
 }
 
 /// Append `n` candidates (their own blob + 0-based `offsets`, n+1 entries) to `c`
@@ -650,6 +685,224 @@ fn ctx_append(c: &mut Ctx, blob: &[u8], offsets: &[i32], n: usize) {
         c.lens.push((e - s) as u32);
     }
     c.n += n;
+}
+
+// ─── blob-ingest handle contexts (ABI 5): candidates never become Lua strings ─
+// A streaming finder over a huge tree (millions of paths) would otherwise materialise every path as a Lua
+// string + table on the main thread — a multi-second load of string-intern-table doublings + GC pauses. The
+// blob API removes the Lua-side pool entirely: the producer's raw stdout bytes are handed straight to the
+// native context, which SPLITS on '\n' and stores each line as a candidate; the Lua side keeps only the
+// visible / top-K rows, materialised on demand via `text`. Contexts here are keyed by an integer HANDLE in a
+// registry (not the single active slot the prepare/append path uses), so a picker's huge pool can never be
+// clobbered by another consumer preparing in between — and, unlike the single slot, it need not be
+// re-uploadable from Lua (the Lua side no longer holds the strings to re-upload).
+
+/// Push ONE candidate (its raw bytes) onto `c`, computing its signature + length. Empty lines are SKIPPED (a
+/// fuzzy candidate is never the empty string; this mirrors the finders' own `p ~= ""` guard), so the ingested
+/// set is byte-identical to preparing the same non-empty lines. Offsets are absolute END offsets with a
+/// leading 0 — identical layout to `ctx_append` / `build_ctx`, so a blob-ingested context matches identically.
+fn ctx_push(c: &mut Ctx, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if c.offs.is_empty() {
+        c.offs.push(0);
+    }
+    c.blob.extend_from_slice(bytes);
+    c.offs.push(c.blob.len() as i32);
+    let mut m = 0u32;
+    for &bb in bytes {
+        m |= sig_byte(bb);
+    }
+    c.sigs.push(m);
+    c.lens.push(bytes.len() as u32);
+    c.n += 1;
+}
+
+/// Ingest a raw byte chunk into `c`, splitting on '\n'. A line straddling the chunk boundary is carried in
+/// `c.pending` until the next chunk (or `ctx_flush_blob`) completes it — so chunking at ANY byte boundary
+/// yields the same candidate set. Existing candidates are never re-scanned (incremental / streaming).
+fn ctx_append_blob(c: &mut Ctx, data: &[u8]) {
+    let mut start = 0;
+    for i in 0..data.len() {
+        if data[i] == b'\n' {
+            if c.pending.is_empty() {
+                ctx_push(c, &data[start..i]);
+            } else {
+                let mut line = std::mem::take(&mut c.pending);
+                line.extend_from_slice(&data[start..i]);
+                ctx_push(c, &line);
+            }
+            start = i + 1;
+        }
+    }
+    if start < data.len() {
+        c.pending.extend_from_slice(&data[start..]);
+    }
+}
+
+/// Flush a trailing partial line (a final line with no terminating '\n') as its own candidate.
+fn ctx_flush_blob(c: &mut Ctx) {
+    if !c.pending.is_empty() {
+        let line = std::mem::take(&mut c.pending);
+        ctx_push(c, &line);
+    }
+}
+
+/// Registry of handle-addressed blob contexts, keyed by a monotonically-issued id.
+struct Registry {
+    map: HashMap<u32, Ctx>,
+    next: u32,
+}
+
+impl Registry {
+    fn new() -> Self {
+        Registry {
+            map: HashMap::new(),
+            next: 1,
+        }
+    }
+}
+
+thread_local! {
+    static REGISTRY: RefCell<Registry> = RefCell::new(Registry::new());
+}
+
+/// Create a new empty blob context and return its handle (a positive id). (ABI ≥ 5.)
+#[unsafe(no_mangle)]
+pub extern "C" fn lvimfuzzy_ctx_new() -> i32 {
+    REGISTRY.with(|r| {
+        let mut reg = r.borrow_mut();
+        let id = reg.next;
+        reg.next += 1;
+        reg.map.insert(id, Ctx::new());
+        id as i32
+    })
+}
+
+/// Ingest `len` raw bytes into handle `id`, splitting on '\n' (a straddling line is carried to the next
+/// chunk). Returns the new candidate count. (ABI ≥ 5.)
+///
+/// # Safety
+/// `data` must be valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lvimfuzzy_ctx_append_blob(id: i32, data: *const u8, len: i32) -> i32 {
+    if data.is_null() || len <= 0 {
+        return REGISTRY.with(|r| r.borrow().map.get(&(id as u32)).map(|c| c.n as i32).unwrap_or(0));
+    }
+    let bytes = unsafe { slice::from_raw_parts(data, len as usize) };
+    REGISTRY.with(|r| {
+        let mut reg = r.borrow_mut();
+        match reg.map.get_mut(&(id as u32)) {
+            Some(c) => {
+                ctx_append_blob(c, bytes);
+                c.n as i32
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Flush handle `id`'s trailing partial line (call at end of stream). Returns the candidate count. (ABI ≥ 5.)
+#[unsafe(no_mangle)]
+pub extern "C" fn lvimfuzzy_ctx_flush(id: i32) -> i32 {
+    REGISTRY.with(|r| {
+        let mut reg = r.borrow_mut();
+        match reg.map.get_mut(&(id as u32)) {
+            Some(c) => {
+                ctx_flush_blob(c);
+                c.n as i32
+            }
+            None => 0,
+        }
+    })
+}
+
+/// The candidate count of handle `id` (0 if unknown). (ABI ≥ 5.)
+#[unsafe(no_mangle)]
+pub extern "C" fn lvimfuzzy_ctx_count(id: i32) -> i32 {
+    REGISTRY.with(|r| r.borrow().map.get(&(id as u32)).map(|c| c.n as i32).unwrap_or(0))
+}
+
+/// Pointer to candidate `idx` (1-based) of handle `id`; its byte length is written to `*out_len`. Returns a
+/// pointer INTO the context's blob (no copy) — valid until the next ingest/flush/drop of this handle mutates
+/// it, so the caller must copy it out immediately (the Lua side `ffi.string`s it before any further ingest).
+/// Null (and `*out_len = 0`) for an unknown handle or out-of-range index. (ABI ≥ 5.)
+///
+/// # Safety
+/// `out_len` must be a valid `*mut i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lvimfuzzy_ctx_text(id: i32, idx: i32, out_len: *mut i32) -> *const u8 {
+    if out_len.is_null() {
+        return ptr::null();
+    }
+    REGISTRY.with(|r| {
+        let reg = r.borrow();
+        if let Some(c) = reg.map.get(&(id as u32))
+            && idx >= 1
+            && (idx as usize) <= c.n
+        {
+            let i = idx as usize;
+            let s = c.offs[i - 1] as usize;
+            let e = c.offs[i] as usize;
+            unsafe {
+                *out_len = (e - s) as i32;
+            }
+            return unsafe { c.blob.as_ptr().add(s) };
+        }
+        unsafe {
+            *out_len = 0;
+        }
+        ptr::null()
+    })
+}
+
+/// PARALLEL prepared match against handle `id` (same ranking + output contract as `lvimfuzzy_match_prepared_par`,
+/// but over a handle-addressed context). Returns the number of rows WRITTEN (≤ `max_out`); also writes the TRUE
+/// total match count (before the cap) to `*out_total` when non-null — so a consumer can show fzf-style
+/// `matched/total` even though only the top `max_out` rows are materialised. Byte-identical results to the
+/// single-slot path. (ABI ≥ 5.)
+///
+/// # Safety
+/// `needle` valid for `needle_len`; out arrays hold `max_out` elements; `out_total` null or a valid `*mut i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lvimfuzzy_ctx_match_par(
+    id: i32,
+    needle: *const u8,
+    needle_len: i32,
+    out_idx: *mut i32,
+    out_score: *mut i32,
+    max_out: i32,
+    out_total: *mut i32,
+) -> i32 {
+    if needle.is_null() || out_idx.is_null() || out_score.is_null() || max_out <= 0 {
+        return 0;
+    }
+    unsafe {
+        let needle = slice::from_raw_parts(needle, needle_len.max(0) as usize);
+        let cap = max_out as usize;
+        let out_i = slice::from_raw_parts_mut(out_idx, cap);
+        let out_s = slice::from_raw_parts_mut(out_score, cap);
+        let (written, total) = REGISTRY.with(|r| {
+            let reg = r.borrow();
+            match reg.map.get(&(id as u32)) {
+                Some(c) => BUFS.with(|bc| parallel_prepared_run(c, &mut bc.borrow_mut(), needle, true, out_i, out_s)),
+                None => (0, 0),
+            }
+        });
+        if !out_total.is_null() {
+            *out_total = total;
+        }
+        written
+    }
+}
+
+/// Drop handle `id`, releasing its context memory. (ABI ≥ 5.)
+#[unsafe(no_mangle)]
+pub extern "C" fn lvimfuzzy_ctx_drop(id: i32) {
+    REGISTRY.with(|r| {
+        r.borrow_mut().map.remove(&(id as u32));
+    });
 }
 
 /// Build the per-completion context ONCE (candidate set fixed; needle varies per
@@ -728,6 +981,92 @@ pub extern "C" fn lvimfuzzy_ctx_free() {
 /// length (counting sort) → per-length runs scored by `score_run` (SIMD tiles +
 /// scalar tail) → O(n) radix sort. `use_simd = false` forces the scalar path (the
 /// diff test drives both and asserts byte-identical output).
+/// Scan candidates `[start, end)` for a >=1-byte needle (its lowercased bytes `lc_needle` + signature `nsig`):
+/// O(1) signature reject, cheap subsequence confirm, length-bucket the survivors, SIMD-score them, and APPEND
+/// `(idx, score, len)` to `b.hits`. Does NOT clear hits or finalize — so it composes: one call over `[0, n)`
+/// (prepared_run) or many range calls whose accumulated hits finalize identically (the chunked async path).
+/// The per-range survivor scratch is reused; hits accumulate. `lc_needle` must outlive the call (a stable
+/// view — never `b.lc_needle`, which score_run may not touch anyway).
+fn scan_range(c: &Ctx, b: &mut Bufs, lc_needle: &[u8], nsig: u32, use_simd: bool, start: usize, end: usize) {
+    let nlen = lc_needle.len();
+    if nlen == 1 {
+        let want = lc_needle[0];
+        for i in start..end {
+            if c.sigs[i] & nsig != nsig {
+                continue;
+            }
+            let s = c.offs[i] as usize;
+            let e = c.offs[i + 1] as usize;
+            let sc = score_m1(&c.blob[s..e], want);
+            if sc > MATCH_FLOOR {
+                b.hits.push((i as u32, sc, c.lens[i]));
+            }
+        }
+        return;
+    }
+    // Collect this range's survivors: O(1) signature reject, then a cheap subsequence confirm (rejects
+    // wrong-order candidates the DP would only reject after a full score — pruning them shrinks the SIMD tile
+    // count for broad queries; for selective queries the survivor set is tiny so this is nearly free).
+    b.survivors.clear();
+    let mut max_len = 0u32;
+    for i in start..end {
+        if c.sigs[i] & nsig == nsig {
+            let s = c.offs[i] as usize;
+            let e = c.offs[i + 1] as usize;
+            if is_subseq(&c.blob[s..e], lc_needle) {
+                b.survivors.push(i as u32);
+                if c.lens[i] > max_len {
+                    max_len = c.lens[i];
+                }
+            }
+        }
+    }
+    let sn = b.survivors.len();
+    if sn == 0 {
+        return;
+    }
+    // counting sort survivors by candidate length → contiguous length runs
+    b.count.clear();
+    b.count.resize(max_len as usize + 1, 0);
+    for k in 0..sn {
+        b.count[c.lens[b.survivors[k] as usize] as usize] += 1;
+    }
+    let mut acc = 0u32;
+    for x in b.count.iter_mut() {
+        let t = *x;
+        *x = acc;
+        acc += t;
+    }
+    if b.surv_sorted.len() < sn {
+        b.surv_sorted.resize(sn, 0);
+    }
+    for k in 0..sn {
+        let si = b.survivors[k];
+        let ln = c.lens[si as usize] as usize;
+        let pos = b.count[ln] as usize;
+        b.count[ln] += 1;
+        b.surv_sorted[pos] = si;
+    }
+    // disjoint borrows: read surv_sorted, write hits + tile
+    let Bufs {
+        surv_sorted,
+        hits,
+        tile,
+        ..
+    } = &mut *b;
+    let surv = &surv_sorted[..sn];
+    let mut p = 0usize;
+    while p < sn {
+        let l = c.lens[surv[p] as usize] as usize;
+        let mut q = p;
+        while q < sn && c.lens[surv[q] as usize] as usize == l {
+            q += 1;
+        }
+        score_run(&surv[p..q], l, &c.blob, &c.offs, lc_needle, use_simd, tile, hits);
+        p = q;
+    }
+}
+
 fn prepared_run(
     c: &Ctx,
     b: &mut Bufs,
@@ -758,92 +1097,87 @@ fn prepared_run(
     // stable raw view of lc_needle (not resized below) so we can also mutate b
     let lc_needle: &[u8] = unsafe { slice::from_raw_parts(b.lc_needle.as_ptr(), nlen) };
 
-    if nlen == 1 {
-        let want = lc_needle[0];
-        for i in 0..c.n {
-            if c.sigs[i] & nsig != nsig {
-                continue;
-            }
-            let s = c.offs[i] as usize;
-            let e = c.offs[i + 1] as usize;
-            let sc = score_m1(&c.blob[s..e], want);
-            if sc > MATCH_FLOOR {
-                b.hits.push((i as u32, sc, c.lens[i]));
-            }
-        }
-    } else {
-        // Collect survivors: O(1) signature reject, then a cheap subsequence
-        // confirm (rejects wrong-order candidates the DP would only reject after a
-        // full score — pruning them shrinks the SIMD tile count for broad queries;
-        // for selective queries the survivor set is tiny so this is nearly free).
-        b.survivors.clear();
-        let mut max_len = 0u32;
-        for i in 0..c.n {
-            if c.sigs[i] & nsig == nsig {
-                let s = c.offs[i] as usize;
-                let e = c.offs[i + 1] as usize;
-                if is_subseq(&c.blob[s..e], lc_needle) {
-                    b.survivors.push(i as u32);
-                    if c.lens[i] > max_len {
-                        max_len = c.lens[i];
-                    }
-                }
-            }
-        }
-        let sn = b.survivors.len();
-        if sn > 0 {
-            // counting sort survivors by candidate length → contiguous length runs
-            b.count.clear();
-            b.count.resize(max_len as usize + 1, 0);
-            for k in 0..sn {
-                b.count[c.lens[b.survivors[k] as usize] as usize] += 1;
-            }
-            let mut acc = 0u32;
-            for x in b.count.iter_mut() {
-                let t = *x;
-                *x = acc;
-                acc += t;
-            }
-            if b.surv_sorted.len() < sn {
-                b.surv_sorted.resize(sn, 0);
-            }
-            for k in 0..sn {
-                let si = b.survivors[k];
-                let ln = c.lens[si as usize] as usize;
-                let pos = b.count[ln] as usize;
-                b.count[ln] += 1;
-                b.surv_sorted[pos] = si;
-            }
-            // disjoint borrows: read surv_sorted, write hits + tile
-            let Bufs {
-                surv_sorted,
-                hits,
-                tile,
-                ..
-            } = &mut *b;
-            let surv = &surv_sorted[..sn];
-            let mut p = 0usize;
-            while p < sn {
-                let l = c.lens[surv[p] as usize] as usize;
-                let mut q = p;
-                while q < sn && c.lens[surv[q] as usize] as usize == l {
-                    q += 1;
-                }
-                score_run(
-                    &surv[p..q],
-                    l,
-                    &c.blob,
-                    &c.offs,
-                    lc_needle,
-                    use_simd,
-                    tile,
-                    hits,
-                );
-                p = q;
-            }
-        }
-    }
+    scan_range(c, b, lc_needle, nsig, use_simd, 0, c.n);
     radix_finalize(b, out_i, out_s)
+}
+
+/// PARALLEL variant of `prepared_run` (ABI 4): the per-candidate scoring is embarrassingly parallel, so split
+/// `[0, n)` into contiguous per-thread blocks scanned CONCURRENTLY on a scoped thread pool, then merge each
+/// block's hits IN THREAD ORDER and radix-finalize once. This is what lets a huge-pool match (single-threaded
+/// ~250 ms at ~2M candidates) finish in tens of ms — fast enough to keep up with typing.
+///
+/// Byte-identical to the sequential `prepared_run`: thread `t` owns the index block `[t*chunk, (t+1)*chunk)`;
+/// within a block `scan_range` already leaves each `(score, len)` tie in index-ascending order, and because
+/// block `t`'s indices all precede block `t+1`'s, merging blocks in ascending `t` keeps the global order
+/// index-ascending — so the stable radix breaks ties exactly as the single-thread scan. `c` is immutable
+/// during a match, shared across the scoped threads by reference (no copy). Small pools / single core fall
+/// back to the sequential path (thread setup + merge is not worth it there).
+fn parallel_prepared_run(
+    c: &Ctx,
+    b: &mut Bufs,
+    needle: &[u8],
+    use_simd: bool,
+    out_i: &mut [i32],
+    out_s: &mut [i32],
+) -> (i32, i32) {
+    b.lc_needle.clear();
+    b.lc_needle.extend(needle.iter().map(|&x| lower(x)));
+    let nlen = b.lc_needle.len();
+    let cap = out_i.len();
+    if nlen == 0 {
+        // empty query = every candidate "matches" → the TRUE total is the whole pool, of which the first
+        // `cap` are returned in source order.
+        let k = cap.min(c.n);
+        for i in 0..k {
+            out_i[i] = i as i32;
+            out_s[i] = 0;
+        }
+        return (k as i32, c.n as i32);
+    }
+    let mut nsig = 0u32;
+    for &x in &b.lc_needle {
+        nsig |= sig_byte(x);
+    }
+    let n = c.n;
+    // Parallelise only a large pool; cap the fan-out so merge/spawn overhead stays bounded on many-core boxes.
+    const PAR_MIN: usize = 40_000;
+    const MAX_THREADS: usize = 16;
+    let hw = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+    let nthreads = hw.min(MAX_THREADS);
+    if nthreads <= 1 || n < PAR_MIN {
+        b.hits.clear();
+        let lc_needle: &[u8] = unsafe { slice::from_raw_parts(b.lc_needle.as_ptr(), nlen) };
+        scan_range(c, b, lc_needle, nsig, use_simd, 0, n);
+        let total = b.hits.len() as i32; // ALL matches (before the cap radix_finalize applies)
+        return (radix_finalize(b, out_i, out_s), total);
+    }
+    // Own the needle in a local (a handful of bytes) so nothing borrows `b` across the scope → `b` is free for
+    // the merge + finalize.
+    let lc_owned: Vec<u8> = b.lc_needle.clone();
+    let chunk = n.div_ceil(nthreads);
+    let mut merged: Vec<Hit> = Vec::new();
+    std::thread::scope(|s| {
+        let lc: &[u8] = &lc_owned;
+        let mut handles = Vec::with_capacity(nthreads);
+        for t in 0..nthreads {
+            let start = (t * chunk).min(n);
+            let end = ((t + 1) * chunk).min(n);
+            if start >= end {
+                break;
+            }
+            handles.push(s.spawn(move || {
+                let mut lb = Bufs::new();
+                scan_range(c, &mut lb, lc, nsig, use_simd, start, end);
+                lb.hits
+            }));
+        }
+        for h in handles {
+            merged.extend(h.join().unwrap_or_default()); // thread order = index order → tie-break preserved
+        }
+    });
+    b.hits = merged;
+    let total = b.hits.len() as i32; // ALL matches (before the cap)
+    (radix_finalize(b, out_i, out_s), total)
 }
 
 /// Match against the prepared context: needle-only, one coarse call per keystroke
@@ -880,6 +1214,36 @@ pub unsafe extern "C" fn lvimfuzzy_match_prepared_scalar(
     unsafe { match_prepared_impl(needle, needle_len, out_idx, out_score, max_out, false) }
 }
 
+/// PARALLEL prepared match (ABI 4): same contract as `lvimfuzzy_match_prepared`, but the scan is fanned out
+/// across worker threads (AVX2 per thread). Fast enough at millions of candidates to run per keystroke without
+/// blocking typing. Byte-identical results to the single-threaded entry.
+///
+/// # Safety
+/// `needle` valid for `needle_len`; out arrays hold `max_out` elements. Called after `lvimfuzzy_prepare` on the
+/// same thread (the scoped worker threads only READ the context, which is immutable during a match).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lvimfuzzy_match_prepared_par(
+    needle: *const u8,
+    needle_len: i32,
+    out_idx: *mut i32,
+    out_score: *mut i32,
+    max_out: i32,
+) -> i32 {
+    if needle.is_null() || out_idx.is_null() || out_score.is_null() || max_out <= 0 {
+        return 0;
+    }
+    unsafe {
+        let needle = slice::from_raw_parts(needle, needle_len.max(0) as usize);
+        let cap = max_out as usize;
+        let out_i = slice::from_raw_parts_mut(out_idx, cap);
+        let out_s = slice::from_raw_parts_mut(out_score, cap);
+        CTX.with(|ccell| {
+            let c = ccell.borrow();
+            BUFS.with(|bcell| parallel_prepared_run(&c, &mut bcell.borrow_mut(), needle, true, out_i, out_s).0)
+        })
+    }
+}
+
 /// # Safety
 /// See `lvimfuzzy_match_prepared`.
 unsafe fn match_prepared_impl(
@@ -907,14 +1271,109 @@ unsafe fn match_prepared_impl(
     }
 }
 
+// ─── cooperative chunked match (ABI 3): drive one keystroke's match in slices ─
+/// Begin a chunked match of `needle` over the prepared context: record the lowercased needle + signature,
+/// reset the cursor, clear the hit accumulator. Returns the candidate count `n` (the caller steps `[0, n)`).
+///
+/// # Safety
+/// `needle` valid for `needle_len`. Called after `lvimfuzzy_prepare` on the same thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lvimfuzzy_match_chunk_begin(needle: *const u8, needle_len: i32) -> i32 {
+    if needle.is_null() {
+        return 0;
+    }
+    let needle = unsafe { slice::from_raw_parts(needle, needle_len.max(0) as usize) };
+    BUFS.with(|bc| bc.borrow_mut().hits.clear());
+    let n = CTX.with(|cc| cc.borrow().n);
+    CHUNK.with(|cc| {
+        let mut ch = cc.borrow_mut();
+        ch.lc_needle.clear();
+        ch.lc_needle.extend(needle.iter().map(|&x| lower(x)));
+        let mut nsig = 0u32;
+        for &x in &ch.lc_needle {
+            nsig |= sig_byte(x);
+        }
+        ch.nsig = nsig;
+        ch.cursor = 0;
+        ch.n = n;
+    });
+    n as i32
+}
+
+/// Scan the next up-to-`budget` candidates (appending their hits to the accumulator); returns the new cursor.
+/// The match is complete once the returned cursor == the `n` from `begin`. An empty needle scans nothing
+/// (finish returns the source-order head). Same thread as `begin`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lvimfuzzy_match_chunk_step(budget: i32) -> i32 {
+    let budget = budget.max(1) as usize;
+    // The CURRENT context size — clamp against it too. It may differ from the `n` recorded at begin: it GROWS
+    // under a stream-append (fine — we scan the begin-time head), or SHRINKS/empties if the context was freed
+    // or replaced between slices. The Lua driver aborts a stale slice before calling us, but clamp defensively
+    // so a race can never index the context out of bounds; if it shrank below `n`, report done so the caller
+    // stops (its result is discarded upstream).
+    let cur_n = CTX.with(|cc| cc.borrow().n);
+    let (start, end, nsig, lc): (usize, usize, u32, Vec<u8>) = CHUNK.with(|cc| {
+        let ch = cc.borrow();
+        if ch.lc_needle.is_empty() {
+            (ch.n, ch.n, 0, Vec::new())
+        } else {
+            let start = ch.cursor.min(cur_n);
+            let end = (start + budget).min(ch.n).min(cur_n);
+            (start, end, ch.nsig, ch.lc_needle.clone())
+        }
+    });
+    if !lc.is_empty() && start < end {
+        CTX.with(|ccell| {
+            let c = ccell.borrow();
+            BUFS.with(|bc| scan_range(&c, &mut bc.borrow_mut(), &lc, nsig, true, start, end));
+        });
+    }
+    CHUNK.with(|cc| {
+        let mut ch = cc.borrow_mut();
+        // context shrank/replaced under us → nothing valid left; jump to `n` so the driver sees "done"
+        ch.cursor = if cur_n < ch.n { ch.n } else { end };
+        ch.cursor as i32
+    })
+}
+
+/// Finalize the chunked match: radix-sort the accumulated hits into the caller's out arrays (capacity
+/// `max_out`), return the count. An empty needle yields the first `max_out` in source order. Byte-identical
+/// to `match_prepared` for the same needle + context.
+///
+/// # Safety
+/// `out_idx`/`out_score` hold `max_out` elements. Same thread as `begin`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lvimfuzzy_match_chunk_finish(out_idx: *mut i32, out_score: *mut i32, max_out: i32) -> i32 {
+    if out_idx.is_null() || out_score.is_null() || max_out <= 0 {
+        return 0;
+    }
+    let cap = max_out as usize;
+    let out_i = unsafe { slice::from_raw_parts_mut(out_idx, cap) };
+    let out_s = unsafe { slice::from_raw_parts_mut(out_score, cap) };
+    let empty = CHUNK.with(|cc| cc.borrow().lc_needle.is_empty());
+    if empty {
+        let n = CTX.with(|cc| cc.borrow().n);
+        let k = cap.min(n);
+        for i in 0..k {
+            out_i[i] = i as i32;
+            out_s[i] = 0;
+        }
+        return k as i32;
+    }
+    BUFS.with(|bc| radix_finalize(&mut bc.borrow_mut(), out_i, out_s))
+}
+
 // ─── C ABI (loaded from Lua via LuaJIT FFI) ──────────────────────────────────
 /// ABI version. The base contract (prepare / match_prepared / match / avx2) is
-/// ABI ≥ 1; incremental `append` + `ctx_free` were added in ABI 2. The loader
-/// accepts any ABI ≥ 1 (existing consumers keep working on this newer .so) and
-/// exposes the ABI-2 features only when this reports ≥ 2.
+/// ABI ≥ 1; incremental `append` + `ctx_free` were added in ABI 2; the cooperative
+/// chunked match (`match_chunk_begin`/`step`/`finish`) in ABI 3; the PARALLEL match
+/// (`match_prepared_par`) in ABI 4; the handle-addressed BLOB-ingest contexts
+/// (`ctx_new`/`ctx_append_blob`/`ctx_flush`/`ctx_count`/`ctx_text`/`ctx_match_par`/`ctx_drop`)
+/// in ABI 5. The loader accepts any ABI ≥ 1 (existing consumers keep working on this newer
+/// .so) and exposes each tier's features only when this reports at or above it.
 #[unsafe(no_mangle)]
 pub extern "C" fn lvimfuzzy_abi() -> i32 {
-    2
+    5
 }
 
 /// 1 if the running CPU has AVX2 (the inter-candidate SIMD tile path is active),
@@ -1038,6 +1497,7 @@ mod tests {
             sigs,
             lens,
             n: cands.len(),
+            pending: Vec::new(),
         }
     }
 
@@ -1149,5 +1609,194 @@ mod tests {
                 assert_eq!(&s1[..n1], &s2[..n2], "score q={q:?} split={split}");
             }
         }
+    }
+
+    /// The chunked path (`scan_range` over `[0,n)` in `budget`-sized slices, then `radix_finalize`) — what the
+    /// ABI-3 begin/step/finish FFI drives across event-loop ticks — mimicked here on an explicit ctx/bufs.
+    fn chunked_run(
+        c: &Ctx,
+        b: &mut Bufs,
+        needle: &[u8],
+        use_simd: bool,
+        budget: usize,
+        out_i: &mut [i32],
+        out_s: &mut [i32],
+    ) -> i32 {
+        b.lc_needle.clear();
+        b.lc_needle.extend(needle.iter().map(|&x| lower(x)));
+        b.hits.clear();
+        let nlen = b.lc_needle.len();
+        if nlen == 0 {
+            let k = out_i.len().min(c.n);
+            for i in 0..k {
+                out_i[i] = i as i32;
+                out_s[i] = 0;
+            }
+            return k as i32;
+        }
+        let mut nsig = 0u32;
+        for &x in &b.lc_needle {
+            nsig |= sig_byte(x);
+        }
+        let lc: &[u8] = unsafe { slice::from_raw_parts(b.lc_needle.as_ptr(), nlen) };
+        let mut cursor = 0usize;
+        while cursor < c.n {
+            let end = (cursor + budget.max(1)).min(c.n);
+            scan_range(c, b, lc, nsig, use_simd, cursor, end);
+            cursor = end;
+        }
+        radix_finalize(b, out_i, out_s)
+    }
+
+    /// The cooperative CHUNKED match, at every budget from a single candidate to the whole set, is
+    /// BYTE-IDENTICAL (count + indices + scores) to the single-shot `prepared_run` — for every query,
+    /// incl. empty / broad / selective / no-match. Proves the async path can never reorder results.
+    #[test]
+    fn chunked_equals_whole() {
+        let queries = [
+            "", "f", "co", "buf", "conf", "gtcl", "handler", "updbuf", "asyncqueue", "e", "get", "z",
+            "zzz",
+        ];
+        for &n in &[5000usize, 20000] {
+            let cands = gen_cands(n);
+            let c = build_ctx(&cands);
+            let mut b1 = Bufs::new();
+            let mut b2 = Bufs::new();
+            for q in queries {
+                let cap = 1000usize;
+                let (mut wi, mut ws) = (vec![0i32; cap], vec![0i32; cap]);
+                let wn = prepared_run(&c, &mut b1, q.as_bytes(), true, &mut wi, &mut ws) as usize;
+                for &budget in &[1usize, 7, 128, 1000, 99_999, n] {
+                    let (mut ci, mut cs) = (vec![0i32; cap], vec![0i32; cap]);
+                    let cn = chunked_run(&c, &mut b2, q.as_bytes(), true, budget, &mut ci, &mut cs) as usize;
+                    assert_eq!(wn, cn, "count q={q:?} n={n} budget={budget}");
+                    assert_eq!(&wi[..wn], &ci[..cn], "idx q={q:?} n={n} budget={budget}");
+                    assert_eq!(&ws[..wn], &cs[..cn], "score q={q:?} n={n} budget={budget}");
+                }
+            }
+        }
+    }
+
+    /// The PARALLEL prepared match is BYTE-IDENTICAL (count + indices + scores) to the single-threaded scan for
+    /// every query — tested both BELOW the parallelisation threshold (sequential fallback) and well ABOVE it
+    /// (the real multi-thread fan-out + in-thread-order merge), so a mis-ordered merge would break ties and be
+    /// caught here.
+    #[test]
+    fn parallel_equals_whole() {
+        let queries = [
+            "", "f", "co", "buf", "conf", "gtcl", "handler", "updbuf", "asyncqueue", "e", "get", "z", "zzz", "s",
+            "cccc", "parse",
+        ];
+        for &n in &[5000usize, 50_000, 120_000] {
+            let cands = gen_cands(n);
+            let c = build_ctx(&cands);
+            let mut b1 = Bufs::new();
+            let mut b2 = Bufs::new();
+            for q in queries {
+                let cap = 1000usize;
+                let (mut wi, mut ws) = (vec![0i32; cap], vec![0i32; cap]);
+                let wn = prepared_run(&c, &mut b1, q.as_bytes(), true, &mut wi, &mut ws) as usize;
+                let (mut pi, mut ps) = (vec![0i32; cap], vec![0i32; cap]);
+                let (pw, ptot) = parallel_prepared_run(&c, &mut b2, q.as_bytes(), true, &mut pi, &mut ps);
+                let pn = pw as usize;
+                assert_eq!(wn, pn, "count q={q:?} n={n}");
+                assert_eq!(&wi[..wn], &pi[..pn], "idx q={q:?} n={n}");
+                assert_eq!(&ws[..wn], &ps[..pn], "score q={q:?} n={n}");
+                // the TRUE total (before the 1000 cap) is ≥ the written count, and equals it when uncapped
+                assert!(ptot as usize >= pn, "total < written q={q:?} n={n}");
+                if pn < cap {
+                    assert_eq!(ptot as usize, pn, "total ≠ matches when uncapped q={q:?} n={n}");
+                }
+            }
+        }
+    }
+
+    /// Ingest `lines` into a fresh Ctx as a raw '\n'-joined BLOB, fed in `chunk`-sized byte slices (so a chunk
+    /// boundary can fall MID-LINE — the pending-line carry is exercised), optionally without a trailing '\n'
+    /// (the flush path), mirroring `lvimfuzzy_ctx_append_blob` + `lvimfuzzy_ctx_flush`.
+    fn feed_blob(lines: &[String], chunk: usize, trailing_nl: bool) -> Ctx {
+        let mut buf = Vec::new();
+        for (k, l) in lines.iter().enumerate() {
+            buf.extend_from_slice(l.as_bytes());
+            if trailing_nl || k + 1 < lines.len() {
+                buf.push(b'\n');
+            }
+        }
+        let mut c = Ctx::new();
+        let mut i = 0;
+        while i < buf.len() {
+            let e = (i + chunk.max(1)).min(buf.len());
+            ctx_append_blob(&mut c, &buf[i..e]);
+            i = e;
+        }
+        ctx_flush_blob(&mut c);
+        c
+    }
+
+    /// A blob-ingested context — fed the candidate lines as raw bytes in chunks of every size (incl. 1 byte,
+    /// so every boundary splits a line) with and without a trailing newline — is byte-identical (SoA arrays
+    /// AND match output for every query) to preparing the same lines the offsets-based way. This is what lets
+    /// the picker hand fd's stdout straight to the native context with ZERO Lua per-row work.
+    #[test]
+    fn blob_equals_prepare_whole() {
+        let queries = [
+            "", "f", "co", "buf", "conf", "gtcl", "handler", "get", "s", "cs", "cfg", "zzzz", "client", "parse",
+        ];
+        let all = gen_cands(4000);
+        let whole = build_ctx(&all);
+        for &chunk in &[1usize, 2, 7, 64, 500, 4096, usize::MAX] {
+            for &trailing in &[true, false] {
+                let inc = feed_blob(&all, chunk, trailing);
+                assert_eq!(inc.n, whole.n, "n (chunk {chunk}, trailing {trailing})");
+                assert_eq!(inc.blob, whole.blob, "blob (chunk {chunk}, trailing {trailing})");
+                assert_eq!(inc.offs, whole.offs, "offs (chunk {chunk}, trailing {trailing})");
+                assert_eq!(inc.sigs, whole.sigs, "sigs (chunk {chunk}, trailing {trailing})");
+                assert_eq!(inc.lens, whole.lens, "lens (chunk {chunk}, trailing {trailing})");
+                let mut b1 = Bufs::new();
+                let mut b2 = Bufs::new();
+                for q in queries {
+                    let cap = 1000usize;
+                    let (mut i1, mut s1) = (vec![0i32; cap], vec![0i32; cap]);
+                    let (mut i2, mut s2) = (vec![0i32; cap], vec![0i32; cap]);
+                    let n1 = prepared_run(&inc, &mut b1, q.as_bytes(), true, &mut i1, &mut s1) as usize;
+                    let n2 = prepared_run(&whole, &mut b2, q.as_bytes(), true, &mut i2, &mut s2) as usize;
+                    assert_eq!(n1, n2, "count q={q:?} chunk={chunk}");
+                    assert_eq!(&i1[..n1], &i2[..n2], "idx q={q:?} chunk={chunk}");
+                    assert_eq!(&s1[..n1], &s2[..n2], "score q={q:?} chunk={chunk}");
+                }
+            }
+        }
+    }
+
+    /// `ctx_text`-shape read-back: every candidate's stored bytes equal the ingested line, at its 1-based
+    /// index (start = offs[idx-1], end = offs[idx]) — the accessor the picker renders visible rows through.
+    #[test]
+    fn blob_text_roundtrip() {
+        let all = gen_cands(1500);
+        let c = feed_blob(&all, 5, true);
+        assert_eq!(c.n, all.len());
+        for (k, line) in all.iter().enumerate() {
+            let s = c.offs[k] as usize;
+            let e = c.offs[k + 1] as usize;
+            assert_eq!(&c.blob[s..e], line.as_bytes(), "text roundtrip idx {k}");
+        }
+    }
+
+    /// Empty lines in the byte stream are skipped (a fuzzy candidate is never the empty string) — a blob with
+    /// blank lines ingests only the non-empty ones, matching the finders' `p ~= ""` guard.
+    #[test]
+    fn blob_skips_empty_lines() {
+        let mut c = Ctx::new();
+        ctx_append_blob(&mut c, b"alpha\n\nbeta\n\n\ngamma\n");
+        ctx_flush_blob(&mut c);
+        assert_eq!(c.n, 3);
+        let read = |i: usize| {
+            let s = c.offs[i] as usize;
+            let e = c.offs[i + 1] as usize;
+            std::str::from_utf8(&c.blob[s..e]).unwrap().to_string()
+        };
+        assert_eq!(read(0), "alpha");
+        assert_eq!(read(1), "beta");
+        assert_eq!(read(2), "gamma");
     }
 }
