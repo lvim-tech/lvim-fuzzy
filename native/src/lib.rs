@@ -77,6 +77,7 @@ struct Bufs {
     hits: Vec<Hit>,
     hits2: Vec<Hit>, // radix ping-pong scratch
     keys: Vec<u32>,  // packed sort key per hit
+    keys2: Vec<u32>, // radix ping-pong scratch for the keys (permuted alongside hits)
     lc_needle: Vec<u8>,
     // SIMD-path scratch (all reused across keystrokes; zero steady-state alloc):
     survivors: Vec<u32>,   // signature-passing candidate indices, in index order
@@ -95,6 +96,7 @@ impl Bufs {
             hits: Vec::new(),
             hits2: Vec::new(),
             keys: Vec::new(),
+            keys2: Vec::new(),
             lc_needle: Vec::new(),
             survivors: Vec::new(),
             surv_sorted: Vec::new(),
@@ -134,6 +136,12 @@ fn is_subseq(c: &[u8], lc_needle: &[u8]) -> bool {
 // fixed (L-1) gap toll. One branch-light scan, no DP. Returns NEG if absent.
 #[inline]
 fn score_m1(c: &[u8], want: u8) -> i32 {
+    // An EMPTY candidate can never match — and indexing `c[0]` below would PANIC (unwinding across
+    // the extern "C" boundary aborts the process). Guard here so EVERY caller is hardened, matching
+    // the prepared path (signature prefilter skips it) and the pure-Lua fallback (`#cand > 0`).
+    if c.is_empty() {
+        return NEG;
+    }
     let l = c.len();
     let toll = l as i32 - 1;
     // Byte 0 match is the global max bonus (FIRST) — decide immediately.
@@ -400,8 +408,14 @@ fn score_run(
     if rn == 0 {
         return;
     }
+    // Cap the SIMD path at l ≤ 16000: the AVX2 tile carries scores in i16 lanes, and the leading-gap
+    // term `-(j as i16)` (j = candidate byte index) TRUNCATES once j > 32767, wrapping a huge negative
+    // gap into a positive one — fabricating a score above MATCH_FLOOR where the scalar i32 path stays
+    // below (SIMD ≠ scalar). A candidate this long can only match ABOVE the −16000 floor within a
+    // razor-thin window, so routing every l > 16000 run to the always-correct scalar path below both
+    // preserves the byte-identical invariant AND avoids building a 16·l tile for megabyte lines.
     #[cfg(target_arch = "x86_64")]
-    if use_simd && m <= SIMD_M && l > 0 && is_x86_feature_detected!("avx2") {
+    if use_simd && m <= SIMD_M && l > 0 && l <= 16000 && is_x86_feature_detected!("avx2") {
         if tile.len() < l * SIMD_W {
             tile.resize(l * SIMD_W, 0);
         }
@@ -455,7 +469,10 @@ fn pack_key(score: i32, len: u32) -> u32 {
     // (BIAS - score) clamped to 20 bits, then 12 bits of length (clamped 0xFFF):
     // higher score → lower key → ranked first; shorter → lower key. The score
     // field sits in bits 12..32, so the radix below MUST cover all 4 bytes.
-    let s = (SCORE_BIAS - score).clamp(0, 0xFFFFF) as u32;
+    // `saturating_sub`, not `-`: `apply_boosts` can saturate a pathological negative boost to
+    // i32::MIN, and `SCORE_BIAS - i32::MIN` overflows i32 (wraps in release → clamps to 0 → the
+    // MOST-penalized candidate would rank FIRST). Saturating keeps the subtraction monotone.
+    let s = SCORE_BIAS.saturating_sub(score).clamp(0, 0xFFFFF) as u32;
     (s << 12) | len.min(0xFFF)
 }
 
@@ -468,8 +485,8 @@ fn radix_finalize(b: &mut Bufs, out_i: &mut [i32], out_s: &mut [i32]) -> i32 {
     if n == 0 {
         return 0;
     }
-    // cache the packed keys once (parallel to hits), then move keys alongside the
-    // payload each pass so pack_key is computed only n times, not 3n.
+    // cache the packed keys once (parallel to hits), then PERMUTE keys alongside the payload each pass
+    // (a ping-pong into keys2, mirroring the hits→hits2 move) so pack_key is computed only n times, not 4n.
     b.keys.clear();
     b.keys.reserve(n);
     for &(_, sc, len) in &b.hits {
@@ -478,9 +495,12 @@ fn radix_finalize(b: &mut Bufs, out_i: &mut [i32], out_s: &mut [i32]) -> i32 {
     if b.hits2.len() < n {
         b.hits2.resize(n, (0, 0, 0));
     }
+    if b.keys2.len() < n {
+        b.keys2.resize(n, 0);
+    }
     // 4 LSD passes of 8 bits cover the full 32-bit key (12-bit length + up-to-20-bit
-    // score field). Each pass writes into hits2 then swaps, so the sorted payload
-    // always ends back in b.hits.
+    // score field). Each pass writes into hits2/keys2 then swaps, so the sorted payload
+    // (and its keys) always ends back in b.hits / b.keys.
     for &shift in &[0u32, 8, 16, 24] {
         let mut count = [0u32; 256];
         for &key in b.keys.iter().take(n) {
@@ -493,18 +513,15 @@ fn radix_finalize(b: &mut Bufs, out_i: &mut [i32], out_s: &mut [i32]) -> i32 {
             acc += t;
         }
         for i in 0..n {
-            let k = ((b.keys[i] >> shift) & 0xFF) as usize;
+            let key = b.keys[i];
+            let k = ((key >> shift) & 0xFF) as usize;
             let pos = count[k] as usize;
             count[k] += 1;
             b.hits2[pos] = b.hits[i];
+            b.keys2[pos] = key; // carry the key to the same slot — no pack_key recompute
         }
         std::mem::swap(&mut b.hits, &mut b.hits2);
-        // reorder keys to match the payload's new order for the next pass
-        if shift != 24 {
-            for i in 0..n {
-                b.keys[i] = pack_key(b.hits[i].1, b.hits[i].2);
-            }
-        }
+        std::mem::swap(&mut b.keys, &mut b.keys2);
     }
     let cnt = n.min(cap);
     for k in 0..cnt {
@@ -563,7 +580,10 @@ fn run_match(
             return cap as i32;
         }
 
-        const MATCHED: i32 = NEG / 2; // scores above this are real matches
+        // Use the SHARED MATCH_FLOOR (−16000) — the SAME cut the prepared/chunked/parallel paths and
+        // the pure-Lua fallback apply — so this stateless path returns a BYTE-IDENTICAL result set. A
+        // local NEG/2 floor (≈ −536M) would additionally admit heavily-penalized long-line matches the
+        // other backends reject, silently diverging the two engines.
         if nlen == 1 {
             // m == 1: fused prefilter + closed-form score, one scan per candidate.
             let want = lc_needle[0];
@@ -571,7 +591,7 @@ fn run_match(
                 let s = offsets[i] as usize;
                 let e = offsets[i + 1] as usize;
                 let sc = score_m1(&blob[s..e], want);
-                if sc > MATCHED {
+                if sc > MATCH_FLOOR {
                     b.hits.push((i as u32, sc, (e - s) as u32));
                 }
             }
@@ -586,7 +606,7 @@ fn run_match(
                     continue;
                 }
                 let sc = score(c, lc_needle);
-                if sc > MATCHED {
+                if sc > MATCH_FLOOR {
                     b.hits.push((i as u32, sc, (e - s) as u32));
                 }
             }
@@ -1193,7 +1213,10 @@ fn parallel_prepared_run(
             }));
         }
         for h in handles {
-            merged.extend(h.join().unwrap_or_default()); // thread order = index order → tie-break preserved
+            // thread order = index order → tie-break preserved. PROPAGATE a worker panic (abort with a
+            // message) rather than `unwrap_or_default` — silently dropping a panicked block's whole hit
+            // set would return an INCOMPLETE result set masquerading as a complete one.
+            merged.extend(h.join().expect("lvim-fuzzy: scan worker panicked"));
         }
     });
     b.hits = merged;
@@ -1473,6 +1496,7 @@ pub unsafe extern "C" fn lvimfuzzy_match(
 ) -> i32 {
     if hay.is_null()
         || offs.is_null()
+        || needle.is_null()
         || out_idx.is_null()
         || out_score.is_null()
         || n <= 0
@@ -1893,5 +1917,66 @@ mod tests {
         let nb = prepared_run(&ctx, &mut bb, q, true, Some(&boosts), &mut ib, &mut sb) as usize;
         assert_eq!(nb, np, "a boost must not change the match SET (same count)");
         assert_eq!(ib[0], underdog, "a huge boost must rank the boosted candidate first");
+    }
+
+    /// Build (blob, offsets) for the STATELESS `run_match` path from raw candidates — which, unlike
+    /// the blob loader, MAY include the empty string (the public one-off `filter()` API allows it).
+    fn stateless_run(cands: &[&str], q: &[u8], out_i: &mut [i32], out_s: &mut [i32]) -> i32 {
+        let mut blob = Vec::new();
+        let mut offs = vec![0i32];
+        for c in cands {
+            blob.extend_from_slice(c.as_bytes());
+            offs.push(blob.len() as i32);
+        }
+        run_match(&blob, &offs, cands.len(), q, out_i, out_s)
+    }
+
+    /// An EMPTY candidate mixed with real ones must NEVER panic (the stateless m==1 loop indexed
+    /// `c[0]` → an out-of-bounds panic aborting the process across the FFI boundary) and must never
+    /// itself match — at m==1 AND m≥2.
+    #[test]
+    fn empty_candidate_never_panics() {
+        for q in [b"a".as_slice(), b"ax".as_slice()] {
+            let cands = ["abc", "", "axe"];
+            let cap = cands.len();
+            let (mut oi, mut os) = (vec![0i32; cap], vec![0i32; cap]);
+            let n = stateless_run(&cands, q, &mut oi, &mut os) as usize;
+            assert!(
+                !oi[..n].contains(&1),
+                "empty candidate must not match query {:?}",
+                std::str::from_utf8(q).unwrap()
+            );
+        }
+    }
+
+    /// The stateless `run_match` must apply the SAME −16000 MATCH_FLOOR as the prepared path: a long,
+    /// heavily-penalized candidate (a 20 kB line matching a 1-char needle at score ≈ −20000) is
+    /// REJECTED by both. Before the floor unification the stateless path (NEG/2 floor) ADMITTED it
+    /// while the prepared path rejected it — diverging the two backends' result sets.
+    #[test]
+    fn stateless_floor_matches_prepared() {
+        let long: String = std::iter::once('z')
+            .chain(std::iter::repeat('a').take(20_000))
+            .collect();
+        let cands: Vec<String> = vec!["zebra".into(), long, "buzz".into()];
+        let refs: Vec<&str> = cands.iter().map(|s| s.as_str()).collect();
+        let q = b"z";
+        let cap = cands.len();
+
+        let (mut si, mut ss) = (vec![0i32; cap], vec![0i32; cap]);
+        let sn = stateless_run(&refs, q, &mut si, &mut ss) as usize;
+
+        let ctx = build_ctx(&cands);
+        let mut b = Bufs::new();
+        let (mut pi, mut ps) = (vec![0i32; cap], vec![0i32; cap]);
+        let pn = prepared_run(&ctx, &mut b, q, true, None, &mut pi, &mut ps) as usize;
+
+        assert_eq!(sn, pn, "stateless and prepared must return the same COUNT");
+        assert_eq!(&si[..sn], &pi[..pn], "stateless and prepared indices must agree");
+        assert_eq!(&ss[..sn], &ps[..pn], "stateless and prepared scores must agree");
+        assert!(
+            !si[..sn].contains(&1),
+            "the 20 kB candidate must be rejected under MATCH_FLOOR"
+        );
     }
 }
