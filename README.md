@@ -42,9 +42,26 @@ toolchain; without it the pure-Lua fallback runs):
 sh native/build.sh
 ```
 
-When installed through **lvim-installer**, the native build runs automatically as
-a post-install step when a Rust toolchain is present, and a prebuilt per-platform
-binary is used otherwise.
+The build runs automatically when the plugin's spec DECLARES it — the loader has
+no way to guess that a plugin wants compiling, so an empty spec installs the Lua
+side and nothing else (which is how a machine with a Rust toolchain still ends up
+on the pure-Lua matcher):
+
+```lua
+{
+    build = "sh native/build.sh",
+    -- Self-healing: the marker records the commit a build ran for, so a build that
+    -- succeeded without producing a usable library would still look current. This
+    -- says what "built" actually means.
+    built = function(ctx)
+        return vim.fn.filereadable(ctx.dir .. "/native/build/liblvimfuzzy.so") == 1
+    end,
+}
+```
+
+With that declared, the loader runs the build on install and again whenever the
+plugin changes, and sweeps for a missing library on later starts. Without a Rust
+toolchain the build fails harmlessly and the pure-Lua fallback runs.
 
 ## Setup
 
