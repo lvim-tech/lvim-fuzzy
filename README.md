@@ -48,15 +48,15 @@ side and nothing else (which is how a machine with a Rust toolchain still ends u
 on the pure-Lua matcher):
 
 ```lua
-{
-    build = "sh native/build.sh",
-    -- Self-healing: the marker records the commit a build ran for, so a build that
-    -- succeeded without producing a usable library would still look current. This
-    -- says what "built" actually means.
-    built = function(ctx)
-        return vim.fn.filereadable(ctx.dir .. "/native/build/liblvimfuzzy.so") == 1
-    end,
-}
+vim.pack.add({
+    {
+        src = "https://github.com/lvim-tech/lvim-fuzzy",
+        build = "sh native/build.sh",
+        built = function(ctx)
+            return vim.fn.filereadable(ctx.dir .. "/native/build/liblvimfuzzy.so") == 1
+        end,
+    },
+})
 ```
 
 With that declared, the loader runs the build on install and again whenever the
@@ -165,9 +165,9 @@ appending 5,000 candidates is ~constant regardless of how large the pool already
 is, whereas a full re-prepare scales with the total:
 
 | base pool | `append(+5000)` | full re-prepare | saving |
-|---|---|---|---|
-| 200,000 | 0.32 ms | 7.3 ms | ~23× |
-| 1,500,000 | 0.39 ms | 51.8 ms | ~134× |
+| --------- | --------------- | --------------- | ------ |
+| 200,000   | 0.32 ms         | 7.3 ms          | ~23×   |
+| 1,500,000 | 0.39 ms         | 51.8 ms         | ~134×  |
 
 (Requires the native backend at ABI ≥ 2; without it — a pure-Lua backend, or an
 older library — `append` still produces identical results, falling back to a full
@@ -175,11 +175,11 @@ re-prepare on the next match.)
 
 ## Backends & correctness
 
-| backend | when | notes |
-|---|---|---|
-| `native-avx2` | .so present, CPU has AVX2 | inter-candidate SIMD tile (fastest) |
-| `native-scalar` | .so present, no AVX2 | scalar affine-gap DP |
-| `lua` | .so absent / forced | byte-exact pure-Lua mirror |
+| backend         | when                      | notes                               |
+| --------------- | ------------------------- | ----------------------------------- |
+| `native-avx2`   | .so present, CPU has AVX2 | inter-candidate SIMD tile (fastest) |
+| `native-scalar` | .so present, no AVX2      | scalar affine-gap DP                |
+| `lua`           | .so absent / forced       | byte-exact pure-Lua mirror          |
 
 The SIMD and scalar native paths are proven byte-identical by an in-crate test
 (`simd_matches_scalar`); the native and Lua backends are proven identical by the
@@ -191,19 +191,19 @@ Same machine, same data, prepared per-keystroke latency (microseconds), vs a
 leading Rust SIMD fuzzy matcher used as the reference. Lower is better; **bold**
 = faster than the reference.
 
-| query | matches | lvim-fuzzy | reference | speedup |
-|---|---|---|---|---|
-| `f` (5k) | 1554 | **39** | 70 | 1.8× |
-| `co` (5k) | 879 | **61** | 65 | 1.1× |
-| `buf` (5k) | 632 | **32** | 61 | 1.9× |
-| `conf` (5k) | 28 | **11** | 33 | 3.1× |
-| `handler` (5k) | 596 | **37** | 89 | 2.4× |
-| `asyncqueue` (5k) | 5 | **3** | 31 | 9.6× |
-| `f` (20k) | 6127 | **158** | 271 | 1.7× |
-| `co` (20k) | 3556 | **233** | 269 | 1.2× |
-| `buf` (20k) | 2428 | **132** | 238 | 1.8× |
-| `handler` (20k) | 2436 | **150** | 361 | 2.4× |
-| `asyncqueue` (20k) | 23 | **11** | 118 | 10.8× |
+| query              | matches | lvim-fuzzy | reference | speedup |
+| ------------------ | ------- | ---------- | --------- | ------- |
+| `f` (5k)           | 1554    | **39**     | 70        | 1.8×    |
+| `co` (5k)          | 879     | **61**     | 65        | 1.1×    |
+| `buf` (5k)         | 632     | **32**     | 61        | 1.9×    |
+| `conf` (5k)        | 28      | **11**     | 33        | 3.1×    |
+| `handler` (5k)     | 596     | **37**     | 89        | 2.4×    |
+| `asyncqueue` (5k)  | 5       | **3**      | 31        | 9.6×    |
+| `f` (20k)          | 6127    | **158**    | 271       | 1.7×    |
+| `co` (20k)         | 3556    | **233**    | 269       | 1.2×    |
+| `buf` (20k)        | 2428    | **132**    | 238       | 1.8×    |
+| `handler` (20k)    | 2436    | **150**    | 361       | 2.4×    |
+| `asyncqueue` (20k) | 23      | **11**     | 118       | 10.8×   |
 
 lvim-fuzzy wins every tested query at both sizes (1.1×–10.8×). All backends stay
 far under the ~16 ms keystroke budget.

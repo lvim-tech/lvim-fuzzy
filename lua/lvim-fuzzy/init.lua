@@ -70,8 +70,6 @@ void lvimfuzzy_ctx_drop(int id);
 local lib
 ---@type string? absolute path the library was loaded from
 local lib_path
----@type integer? the loaded library's reported ABI
-local lib_abi
 ---@type boolean whether the loaded library supports incremental append (ABI ≥ 2)
 local has_append = false
 ---@type boolean whether the loaded library supports the cooperative chunked match (ABI ≥ 3)
@@ -131,7 +129,6 @@ local function load_native()
                 if abi_ok and abi >= ABI_MIN then
                     lib = loaded
                     lib_path = p
-                    lib_abi = abi
                     has_append = abi >= ABI_APPEND
                     has_chunk = abi >= ABI_CHUNK
                     has_par = abi >= ABI_PAR
@@ -741,7 +738,6 @@ function M.setup(opts)
     probed = false
     lib = nil
     lib_path = nil
-    lib_abi = nil
     has_append = false
     has_chunk = false
     has_par = false
