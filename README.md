@@ -1,51 +1,39 @@
 # lvim-fuzzy
 
-The shared native fuzzy-matching **engine** for the lvim-tech set. `lvim-cmp` and
-`lvim-picker` both rank through it, so they order results one identical way.
+The fuzzy search **engine** of the lvim-tech set in Neovim. `lvim-picker` and
+`lvim-cmp` both rank through it.
 
-The hot path is a small Rust shared library loaded **in-process** via LuaJIT FFI:
-an affine-gap local-alignment scorer with first-char / word-boundary / camelCase
-/ consecutive-run bonuses folded into the score, an **inter-candidate AVX2 SIMD**
-tile that ranks 16 candidates per instruction, an O(1) byte-signature prefilter,
-and a stable O(n) radix sort. When the library is absent (no Rust toolchain) a
-**byte-identical pure-Lua fallback** runs, so results never change depending on
-the backend.
+The engine is [lvim-fuzzy-core](https://github.com/lvim-tech/lvim-fuzzy-core),
+in Rust — the same one the terminal finder
+[lvim-fuzzy-cli](https://github.com/lvim-tech/lvim-fuzzy-cli) runs on, so a query
+ranks the same in the picker, in completion and in the terminal. This plugin is
+the Neovim side: a thin C ABI over core (`native/`, a shared library loaded
+**in-process** with LuaJIT FFI) and the Lua API on top.
 
-The Lua↔native boundary is **coarse**: the candidate set is uploaded once per
-completion/pick (`prepare`), then every keystroke is a single FFI call carrying
-only the query and returning sorted indices + scores — never a call per candidate.
+The Lua↔native boundary is **coarse**: a candidate set lives in a native
+context, filled once (`prepare`, `append`) or straight from a process's output
+(`blob_*`); every keystroke is one FFI call carrying only the query and
+returning the ranked indices. While the query only grows, the next search reads
+only the previous matches.
 
-## Highlights
-
-- **Fast.** On our benchmark (below) it beats a leading Rust SIMD fuzzy matcher
-  on every tested query, at both 5k and 20k candidates.
-- **Deterministic.** A total order — score descending, then shorter candidate,
-  then source index ascending. Identical inputs always rank identically; no
-  arbitrary equal-score reshuffling.
-- **Honest fallback.** The pure-Lua matcher is a byte-exact mirror of the native
-  scorer; `:checkhealth lvim-fuzzy` runs a live diff of the two.
-- **Zero per-keystroke allocation** on the native path; one FFI call per keystroke.
+> **Breaking (ABI 7).** The native library is now required — the pure-Lua
+> matcher is gone — and queries take fzf's syntax with smart case by default
+> (see [Queries](#queries)). An older library (ABI 1–6) is refused;
+> `:checkhealth lvim-fuzzy` says how to rebuild.
 
 ## Installation
 
 Install with the lvim-tech installer (**lvim-installer**) or Neovim's native
-[`vim.pack`](https://neovim.io/doc/user/pack.html):
-
-```lua
-vim.pack.add({ "https://github.com/lvim-tech/lvim-fuzzy" })
-```
-
-Then, optionally, build the native library for full speed (needs a Rust
-toolchain; without it the pure-Lua fallback runs):
+[`vim.pack`](https://neovim.io/doc/user/pack.html), and build the library (needs
+a Rust toolchain; the first build fetches lvim-fuzzy-core from GitHub, pinned to
+a commit):
 
 ```sh
 sh native/build.sh
 ```
 
 The build runs automatically when the plugin's spec DECLARES it — the loader has
-no way to guess that a plugin wants compiling, so an empty spec installs the Lua
-side and nothing else (which is how a machine with a Rust toolchain still ends up
-on the pure-Lua matcher):
+no way to guess that a plugin wants compiling:
 
 ```lua
 vim.pack.add({
@@ -60,8 +48,26 @@ vim.pack.add({
 ```
 
 With that declared, the loader runs the build on install and again whenever the
-plugin changes, and sweeps for a missing library on later starts. Without a Rust
-toolchain the build fails harmlessly and the pure-Lua fallback runs.
+plugin changes, and sweeps for a missing library on later starts.
+
+## Queries
+
+The defaults are lvim-fuzzy-cli's (and fzf's):
+
+| query        | matches                                            |
+| ------------ | -------------------------------------------------- |
+| `conf ui`    | both terms, in any order (a space is AND)          |
+| `'exact`     | the exact substring                                |
+| `^src`       | starts with `src`                                  |
+| `.lua$`      | ends with `.lua`                                   |
+| `!test`      | does not contain `test`                            |
+| `lua \| rs`  | either                                             |
+| `fb` / `FB`  | smart case: lower case folds, a capital is kept    |
+| `cafe`       | `café` too (Latin letters match accented forms)    |
+
+Every search call takes an optional `opts` table over the config, e.g.
+lvim-cmp passes `{ extended = false, case = "ignore" }` (the typed word is one
+needle, in any case).
 
 ## Setup
 
@@ -69,18 +75,20 @@ Calling `setup()` is optional — the defaults work. The full default config:
 
 ```lua
 require("lvim-fuzzy").setup({
-    -- "auto" loads the native library when present and ABI-compatible, and uses
-    -- the byte-identical pure-Lua matcher otherwise. "native" requires the .so
-    -- (error in :checkhealth if missing); "lua" forces the fallback.
-    backend = "auto",
     -- Absolute path to liblvimfuzzy.{so,dylib,dll}. nil auto-probes: $LVIM_FUZZY_LIB,
     -- then native/build/, then native/target/release/.
     library_path = nil,
-    -- Cap on the materialised result list per query (0 = no cap), so a broad query
-    -- over a huge candidate set never builds hundreds of thousands of rows.
+    -- Cap on the materialised result list per query (0 = no cap); the total that
+    -- matched is still counted.
     max_results = 1000,
-    -- Emit one INFO notification the first time a match runs on the Lua fallback.
-    warn_on_fallback = true,
+    -- Search defaults of every call (a call's `opts` overrides them).
+    case = "smart", -- "smart" | "ignore" | "respect"
+    extended = true, -- fzf's extended syntax
+    exact = false, -- every term an exact substring
+    normalize = true, -- `cafe` finds `café`
+    scheme = "default", -- "default" | "path" | "history"
+    typos = 0, -- characters a fuzzy term may miss, or "auto"
+    exact_window = nil, -- widest window scored exactly (nil = the engine's default)
 })
 ```
 
@@ -89,124 +97,84 @@ require("lvim-fuzzy").setup({
 ```lua
 local fuzzy = require("lvim-fuzzy")
 
--- Build a context once per fixed candidate set (a list of strings).
+-- A context once per candidate set; `opts` (optional) is what match uses by default.
+-- Every candidate is kept (an empty one too), so indices are indices into the list.
 local ctx = fuzzy.prepare({ "getClient", "config_set", "buffer.line" })
 
--- Rank against a query on every keystroke — one FFI call.
--- results[k] = { index = <1-based index into candidates>, score = <integer> }
-local results, count = fuzzy.match("gc", ctx)
+-- Rank on every keystroke — one FFI call.
+-- results[k] = { index = <1-based>, score = <integer> }; total = every match (before the cap)
+local results, count, total = fuzzy.match("gc", ctx)
 
--- Grow the pool WITHOUT rebuilding it: only the new candidates are scanned.
--- match() then ranks the whole grown set; result is identical to prepare(old ++ new).
+-- Per-candidate score offsets folded in before the ranking (lvim-cmp's boosts);
+-- ties keep the engine's order.
+fuzzy.match("gc", ctx, { 0, 50, 0 })
+
+-- Grow the set: only the new candidates cross.
 fuzzy.append(ctx, { "getConfig", "get_client" })
 
--- Optionally release a large context's native memory when done (harmless to skip):
+-- The same on a later tick (a newer request supersedes it).
+fuzzy.match_async("gc", ctx, function(results, count, total) end)
+
+-- Release the native memory now (otherwise the GC does it).
 fuzzy.free(ctx)
 
--- One-off stateless rank (prepare + match), for callers that keep no context:
-local results2 = fuzzy.filter({ "abc", "abd" }, "ab")
+-- One-off rank without a kept context.
+local r = fuzzy.filter({ "abc", "abd" }, "ab")
 
--- Matched-char byte columns (1-based, ascending) of a query inside ONE candidate —
--- the exact alignment the scorer credits, for highlighting a menu's VISIBLE rows.
--- Pure Lua on every backend (identical result either way); nil on a non-match.
-local cols = fuzzy.positions("getClient", "gc")
+-- What to highlight in ONE candidate (visible rows only); nil on a non-match.
+fuzzy.positions("getClient", "gc") -- 1-based BYTE columns of the alignment (a menu)
+fuzzy.highlights("ab ab", "ab") -- 0-based CHARACTER indices, every occurrence (a list)
 
 -- Introspection (used by :checkhealth):
-fuzzy.backend() -- "native-avx2" | "native-scalar" | "lua"
+fuzzy.backend() -- "native-avx2" | "native-scalar" | "none"
 fuzzy.native_loaded() -- boolean
+fuzzy.load_error() -- why not, or nil
 fuzzy.library_path() -- string|nil
-fuzzy.abi() -- integer (highest ABI this Lua understands)
-fuzzy.has_append() -- boolean (library supports incremental append, ABI >= 2)
-fuzzy.has_blob() -- boolean (library supports blob ingestion, ABI >= 5)
+fuzzy.abi(), fuzzy.native_abi() -- 7, the loaded library's ABI
 ```
 
-### Blob ingestion (streaming, no per-candidate Lua strings)
+`has_append()`, `has_chunk()`, `has_par()`, `has_blob()` and `has_boost()` from
+ABI 1–6 remain and say whether the library is loaded: every feature is in ABI 7.
 
-For a consumer streaming a HUGE candidate set (e.g. a file picker over millions
-of paths), materialising every candidate as a Lua string + table is the
-bottleneck — a multi-second load of LuaJIT string-intern-table growth and GC
-pauses over the pool. The blob API removes the Lua-side pool entirely: the
-producer's raw stdout **bytes** go straight to a native context (which splits on
-`\n` and stores each line as a candidate), and the consumer materialises only the
-visible / top-K rows on demand via `blob_text`. Each context is a HANDLE in a
-native registry (not the single active prepare/match slot), so a huge pool can
-never be clobbered by another consumer preparing in between.
+### Blob contexts (streaming, no per-candidate Lua strings)
+
+For a consumer streaming a HUGE candidate set (a file picker over millions of
+paths), the producer's raw stdout **bytes** go straight to a native context,
+which splits them on `\n` (empty lines skipped); the consumer materialises only
+the rows it shows.
 
 ```lua
-local b = fuzzy.blob_new() -- nil when the library predates ABI 5 (use the string path)
-fuzzy.blob_append(b, raw_stdout_chunk) -- raw bytes; split on \n natively; returns the count
-fuzzy.blob_flush(b) -- flush a final line with no trailing \n (call once at end of stream)
-fuzzy.blob_count(b) -- current candidate count
+local b = fuzzy.blob_new() -- nil when the library is not loaded
+fuzzy.blob_append(b, raw_stdout_chunk) -- any chunking; returns the count
+fuzzy.blob_flush(b) -- a final line with no trailing \n
+fuzzy.blob_count(b)
 
--- Rank asynchronously (parallel scan, delivered on a scheduled tick — never blocks typing).
--- results[k] = { index = <1-based native index>, score }
-fuzzy.blob_match(b, "src", function(results, count)
-    local text = fuzzy.blob_text(b, results[1].index) -- materialise a row's text on demand
-end)
+-- Rank on a scheduled tick. `opts.scope` searches a grep result (`path:line:text`)
+-- by its "line", its "path", or its "file"'s content (every term exact).
+fuzzy.blob_match(b, "src", function(results, count, total)
+    local text = fuzzy.blob_text(b, results[1].index)
+end, { scope = "line" })
 
-fuzzy.blob_free(b) -- release the native memory (recommended on close)
+fuzzy.blob_free(b)
 ```
 
-Byte-identical to preparing the same lines the offsets-based way (proven by the
-`blob_equals_prepare_whole` Rust test over every chunk boundary). Requires the
-native backend at ABI ≥ 5; `blob_new()` returns nil otherwise, and the consumer
-keeps its per-string path (gate on `fuzzy.has_blob()`).
+One million paths load in ~120 ms and a query over them takes 13–35 ms
+(AMD Ryzen 9 3900XT, every core). The engine's own benchmark against frizbee is
+in [lvim-fuzzy-core](https://github.com/lvim-tech/lvim-fuzzy-core#benchmark).
 
-## Incremental append
+## Ranking
 
-For a growing pool (e.g. a picker streaming results), `append` extends a prepared
-context **in place** — it builds only the new candidates' byte offsets, 32-bit
-signatures and lengths; the existing entries are never re-scanned. `match(ctx)`
-then ranks the whole grown set, and the result is **byte-identical** to
-`prepare(old ++ new)`.
+A total, deterministic order: score descending, then the shorter candidate,
+then the earlier one. The scoring model is lvim-fuzzy-core's
+([docs/scoring.md](https://github.com/lvim-tech/lvim-fuzzy-core/blob/main/docs/scoring.md))
+and is tested there.
 
-The cost is proportional to the number of NEW candidates, not the pool size —
-appending 5,000 candidates is ~constant regardless of how large the pool already
-is, whereas a full re-prepare scales with the total:
+## Tests
 
-| base pool | `append(+5000)` | full re-prepare | saving |
-| --------- | --------------- | --------------- | ------ |
-| 200,000   | 0.32 ms         | 7.3 ms          | ~23×   |
-| 1,500,000 | 0.39 ms         | 51.8 ms         | ~134×  |
-
-(Requires the native backend at ABI ≥ 2; without it — a pure-Lua backend, or an
-older library — `append` still produces identical results, falling back to a full
-re-prepare on the next match.)
-
-## Backends & correctness
-
-| backend         | when                      | notes                               |
-| --------------- | ------------------------- | ----------------------------------- |
-| `native-avx2`   | .so present, CPU has AVX2 | inter-candidate SIMD tile (fastest) |
-| `native-scalar` | .so present, no AVX2      | scalar affine-gap DP                |
-| `lua`           | .so absent / forced       | byte-exact pure-Lua mirror          |
-
-The SIMD and scalar native paths are proven byte-identical by an in-crate test
-(`simd_matches_scalar`); the native and Lua backends are proven identical by the
-health parity diff. So every path yields the **same ranking**.
-
-## Benchmark
-
-Same machine, same data, prepared per-keystroke latency (microseconds), vs a
-leading Rust SIMD fuzzy matcher used as the reference. Lower is better; **bold**
-= faster than the reference.
-
-| query              | matches | lvim-fuzzy | reference | speedup |
-| ------------------ | ------- | ---------- | --------- | ------- |
-| `f` (5k)           | 1554    | **39**     | 70        | 1.8×    |
-| `co` (5k)          | 879     | **61**     | 65        | 1.1×    |
-| `buf` (5k)         | 632     | **32**     | 61        | 1.9×    |
-| `conf` (5k)        | 28      | **11**     | 33        | 3.1×    |
-| `handler` (5k)     | 596     | **37**     | 89        | 2.4×    |
-| `asyncqueue` (5k)  | 5       | **3**      | 31        | 9.6×    |
-| `f` (20k)          | 6127    | **158**    | 271       | 1.7×    |
-| `co` (20k)         | 3556    | **233**    | 269       | 1.2×    |
-| `buf` (20k)        | 2428    | **132**    | 238       | 1.8×    |
-| `handler` (20k)    | 2436    | **150**    | 361       | 2.4×    |
-| `asyncqueue` (20k) | 23      | **11**     | 118       | 10.8×   |
-
-lvim-fuzzy wins every tested query at both sizes (1.1×–10.8×). All backends stay
-far under the ~16 ms keystroke budget.
+```sh
+make test                           # the Lua API, in a headless nvim
+cd native && cargo test             # the C ABI layer
+```
 
 ## Health
 
@@ -214,9 +182,8 @@ far under the ~16 ms keystroke budget.
 :checkhealth lvim-fuzzy
 ```
 
-reports the active backend and library path, whether the .so's ABI matches,
-whether AVX2 is available, config validity, and a live byte-for-byte parity diff
-of the native and Lua matchers.
+reports whether the library is loaded (and why not), its path and ABI, whether
+the CPU runs the engine's AVX2 paths, config validity, and a sample query.
 
 ## License
 

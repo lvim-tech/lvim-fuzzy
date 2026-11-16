@@ -1,15 +1,20 @@
 [package]
 name = "lvim-fuzzy-native"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "BSD-3-Clause"
-description = "lvim-fuzzy native matcher: affine-gap fuzzy scorer with inter-candidate AVX2 SIMD"
+description = "lvim-fuzzy native library: the C ABI over lvim-fuzzy-core for Neovim (LuaJIT FFI)"
 
 # Produces liblvimfuzzy.so (cdylib) loaded from Lua via LuaJIT FFI; the rlib lets
-# `cargo test` run the in-crate simd==scalar parity test.
+# `cargo test` run the tests of the wrapper.
 [lib]
 name = "lvimfuzzy"
 crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The search engine shared with lvim-fuzzy-cli. Pinned to a commit so every build
+# ranks the same way; moved to a tag once lvim-fuzzy-core is tagged.
+lvim-fuzzy-core = { git = "https://github.com/lvim-tech/lvim-fuzzy-core", rev = "6e459f74c60db4ee40edd1c4611d569e90e2b5fa" }
 
 [profile.release]
 opt-level = 3

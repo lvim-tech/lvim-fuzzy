@@ -1,8 +1,9 @@
 #!/bin/sh
-# Build the lvim-fuzzy native matcher into native/build/liblvimfuzzy.so — the
+# Build the lvim-fuzzy native library into native/build/liblvimfuzzy.so — the
 # path the Lua FFI loader (lua/lvim-fuzzy/init.lua) probes first. Requires a Rust
-# toolchain (cargo); if none is present the plugin transparently uses its
-# pure-Lua fallback, so this build is optional.
+# toolchain (cargo) and, on the first build, the network: cargo fetches the
+# search engine (lvim-fuzzy-core) from GitHub. The library is required — there
+# is no pure-Lua matcher.
 #
 #   sh native/build.sh
 #

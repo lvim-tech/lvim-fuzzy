@@ -1,5 +1,9 @@
 # lvim-fuzzy — fuzzy engine benchmark
 
+> These numbers are of the matcher lvim-fuzzy had before ABI 7. The engine is
+> now lvim-fuzzy-core; its current benchmark (against frizbee) is in
+> [lvim-fuzzy-core](https://github.com/lvim-tech/lvim-fuzzy-core#benchmark).
+
 A fair, same-input comparison of `lvim-fuzzy` (the native Rust matcher behind
 `lvim-picker` and `lvim-cmp`) against the other fuzzy engines in common use. Every
 engine is fed the **identical corpus** and the **identical query** for each scenario,
