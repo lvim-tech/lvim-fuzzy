@@ -26,6 +26,17 @@ it("finds every occurrence, smart-case", function()
     eq(0, #preview.matches({ "health" }, "Health"))
 end)
 
+it("folds the case of any script, not only ASCII", function()
+    -- `пи` finds `Пиши`; a Cyrillic capital makes the term case-sensitive
+    local line = "1. Пиши САМО в тази папка"
+    local m = preview.matches({ line }, "пи")
+    eq(1, #m)
+    eq("Пи", line:sub(m[1].c0 + 1, m[1].c1))
+    eq(false, preview.terms("Пи")[1].ci)
+    eq(0, #preview.matches({ "пиши" }, "Пи"))
+    eq(1, #preview.matches({ "Ёлка" }, "ёл"))
+end)
+
 describe("lvim-fuzzy.preview: show")
 
 it("opens the file at its line and marks the query there", function()

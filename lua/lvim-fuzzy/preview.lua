@@ -31,8 +31,15 @@ local function group(name, fallback)
     return vim.fn.hlexists(name) == 1 and name or fallback
 end
 
+--- Lower case for any script (string.lower only folds ASCII: `Пиши` stays as it is).
+---@param s string
+---@return string
+local function fold(s)
+    return vim.fn.tolower(s)
+end
+
 --- The query's literal terms: fzf extended-search markers stripped (`'x`, `^x`, `x$`), negations (`!x`)
---- and `|` dropped. Smart case per term: no uppercase letter → case-insensitive.
+--- and `|` dropped. Smart case per term: no upper-case letter (in any script) → case-insensitive.
 ---@param query string
 ---@return { text: string, ci: boolean }[]
 function M.terms(query)
@@ -41,7 +48,7 @@ function M.terms(query)
         if tok ~= "|" and tok:sub(1, 1) ~= "!" then
             local t = tok:gsub("^['^]+", ""):gsub("[$']+$", "")
             if t ~= "" then
-                out[#out + 1] = { text = t, ci = not t:find("%u") }
+                out[#out + 1] = { text = t, ci = fold(t) == t }
             end
         end
     end
@@ -55,9 +62,17 @@ end
 function M.matches(lines, query)
     local out = {}
     for _, term in ipairs(M.terms(query)) do
-        local needle = term.ci and term.text:lower() or term.text
+        local needle = term.ci and fold(term.text) or term.text
         for i, line in ipairs(lines) do
-            local hay = term.ci and line:lower() or line
+            local hay = line
+            if term.ci then
+                -- byte offsets come from the folded line: only when folding kept
+                -- every byte where it was (Cyrillic, Latin, ... do)
+                local f = fold(line)
+                if #f == #line then
+                    hay = f
+                end
+            end
             local at = 1
             while true do
                 local s0, e0 = hay:find(needle, at, true)
